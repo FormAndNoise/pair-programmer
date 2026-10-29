@@ -1,0 +1,55 @@
+"""Tests for sandbox runner and path confinement."""
+
+import tempfile
+import unittest
+from pathlib import Path
+from sandbox.runner import SandboxRunner
+
+
+class TestSandboxRunner(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.workspace = Path(self.temp_dir.name)
+        self.runner = SandboxRunner(
+            workspace_dir=self.workspace,
+            default_timeout_seconds=2,
+            max_output_chars=500,
+        )
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_path_confinement_valid(self):
+        p = self.runner.resolve_path("subfolder/file.txt")
+        self.assertTrue(p.is_relative_to(self.workspace))
+
+    def test_path_confinement_traversal_blocked(self):
+        with self.assertRaises(PermissionError):
+            self.runner.resolve_path("../../windows/system32")
+
+    def test_run_command_success(self):
+        res = self.runner.run_command("python -c \"print('Hello from Sandbox')\"")
+        self.assertEqual(res.exit_code, 0)
+        self.assertIn("Hello from Sandbox", res.stdout)
+        self.assertFalse(res.timed_out)
+
+    def test_run_command_failure_exit_code(self):
+        res = self.runner.run_command("python -c \"import sys; sys.exit(42)\"")
+        self.assertEqual(res.exit_code, 42)
+        self.assertFalse(res.timed_out)
+
+    def test_run_command_timeout(self):
+        # 5 second sleep should exceed the 1 second timeout
+        res = self.runner.run_command("python -c \"import time; time.sleep(5)\"", timeout_seconds=1)
+        self.assertTrue(res.timed_out)
+        self.assertIn("WATCHDOG", res.stderr)
+
+    def test_output_truncation(self):
+        # Generate 2000 chars of output (runner limit is 500)
+        res = self.runner.run_command("python -c \"print('A' * 2000)\"")
+        self.assertIn("TRUNCATED", res.stdout)
+        self.assertLessEqual(len(res.stdout), 800)
+
+
+if __name__ == "__main__":
+    unittest.main()
