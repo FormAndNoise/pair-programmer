@@ -27,6 +27,8 @@ class PairProgrammingTUI:
         self.stories: List[Dict[str, Any]] = []
         self.dialogue_history: List[Dict[str, str]] = []
         self.vm_logs: List[str] = []
+        self.is_paused: bool = False
+        self.steering_buffer: str = ""
         self.dod_state: Dict[str, bool] = {
             "syntax_valid": False,
             "tests_passed": False,
@@ -43,6 +45,19 @@ class PairProgrammingTUI:
 
         if event.event_type == EventType.SPRINT_START:
             self.epic_goal = payload.get("epic", self.epic_goal)
+
+        elif event.event_type == EventType.BACKLOG_DECOMPOSED:
+            self.epic_goal = payload.get("epic", self.epic_goal)
+            existing_ids = {s["id"] for s in self.stories}
+            for item in payload.get("stories", []):
+                if item.get("id") and item["id"] not in existing_ids:
+                    self.stories.append({
+                        "id": item["id"],
+                        "title": item.get("title", "Story"),
+                        "status": item.get("status", "TODO"),
+                    })
+                    existing_ids.add(item["id"])
+            self._append_vm_log(f"[po] Decomposed epic into {payload.get('story_count', len(self.stories))} stories.")
 
         elif event.event_type == EventType.STORY_START:
             self.active_story_title = payload.get("title", "Active Story")
@@ -123,12 +138,40 @@ class PairProgrammingTUI:
             if len(self.vm_logs) > 6:
                 self.vm_logs.pop(0)
 
+        elif event.event_type == EventType.REFACTOR_ITERATION:
+            attempt = payload.get("attempt", 1)
+            max_att = payload.get("max_attempts", 1)
+            self._append_vm_log(f"[refactor] Attempt {attempt}/{max_att}: self-healing implementation")
+
+        elif event.event_type == EventType.OPERATOR_PAUSE:
+            self.is_paused = True
+            self._append_vm_log("[operator] Sprint PAUSED -- type guidance & press Enter, or Space to resume")
+
+        elif event.event_type == EventType.OPERATOR_RESUME:
+            self.is_paused = False
+            self.steering_buffer = ""
+            self._append_vm_log("[operator] Sprint RESUMED")
+
+        elif event.event_type == EventType.OPERATOR_STEER:
+            guidance = payload.get("guidance", "")
+            self._append_vm_log(f"[steer] Guidance queued: {guidance[:70]}")
+
+        elif event.event_type == EventType.OPERATOR_STOP:
+            self.is_paused = False
+            self._append_vm_log("[operator] Clean stop requested -- exiting sprint")
+
         elif event.event_type == EventType.STORY_DONE:
             for s in self.stories:
                 if s["id"] == payload.get("story_id"):
                     s["status"] = "DONE"
                     break
             self.active_story_status = "DONE"
+
+    def _append_vm_log(self, line: str) -> None:
+        """Append a line to the bounded VM log buffer."""
+        self.vm_logs.append(line[:100])
+        if len(self.vm_logs) > 6:
+            self.vm_logs.pop(0)
 
     def _format_display_model(self, model: str, compact: bool = False) -> str:
         """Format model identifier cleanly to avoid mid-word slicing and ambiguity."""
@@ -334,8 +377,12 @@ class PairProgrammingTUI:
         driver_display = self._format_display_model(self.active_driver, compact=is_compact)
         navigator_display = self._format_display_model(self.active_navigator, compact=is_compact)
 
-        if self.active_story_status == "DONE":
+        if self.is_paused:
+            stage_activity_badge = "[bold #000000 on #FACC15] PAUSED [/]"
+        elif self.active_story_status == "DONE":
             stage_activity_badge = "[bold #000000 on #22C55E] DONE [/]" if is_compact else "[bold #000000 on #22C55E] COMPLETE [/]"
+        elif "REFACTOR" in self.active_story_status:
+            stage_activity_badge = "[bold #000000 on #FACC15] HEAL [/]" if is_compact else "[bold #000000 on #FACC15] REFACTOR [/]  [bold #FACC15]SELF-HEALING[/]"
         elif "GREEN" in self.active_story_status:
             stage_activity_badge = "[bold #000000 on #22C55E] IMPL [/]" if is_compact else "[bold #000000 on #22C55E] ACTIVE [/]  [bold #38BDF8]IMPLEMENTING[/]"
         elif "RED" in self.active_story_status:

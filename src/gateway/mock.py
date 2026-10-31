@@ -34,6 +34,10 @@ class ScriptedMockGateway:
         )
         self.queue_response(model, msg)
 
+    def has_queued_responses(self, model: str) -> bool:
+        """Return True when the mock queue has at least one pending response for model."""
+        return bool(self._queues.get(model))
+
     def send_chat(
         self,
         model: str,

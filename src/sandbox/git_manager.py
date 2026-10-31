@@ -143,7 +143,8 @@ class GitManager:
     def _on_status_change(self, event: AgentEvent) -> None:
         story_id = event.payload.get("story_id")
         status = event.payload.get("status")
-        if not story_id or not status or self._last_status.get(story_id) == status:
+        prev_status = self._last_status.get(story_id)
+        if not story_id or not status or prev_status == status:
             return
         self._last_status[story_id] = status
         title = self._titles.get(story_id, story_id)
@@ -154,12 +155,18 @@ class GitManager:
                 self.commit_phase, story_id, "test",
                 f"add failing tests for {title}", self._test_authors.get(story_id),
             )
-        # Entering REVIEW means the GREEN phase finished: commit the code.
+        # Entering REVIEW means the GREEN or REFACTOR phase finished: commit the code.
         elif status == "REVIEW":
-            self._guard(
-                self.commit_phase, story_id, "feat",
-                f"implement {title}", self._implementers.get(story_id),
-            )
+            if prev_status == "REFACTOR":
+                self._guard(
+                    self.commit_phase, story_id, "fix",
+                    f"refactor and heal {title}", self._implementers.get(story_id),
+                )
+            else:
+                self._guard(
+                    self.commit_phase, story_id, "feat",
+                    f"implement {title}", self._implementers.get(story_id),
+                )
 
     def _on_dod_evaluation(self, event: AgentEvent) -> None:
         story_id = event.payload.get("story_id")

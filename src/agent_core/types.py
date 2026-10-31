@@ -27,6 +27,7 @@ class StoryStatus(str, Enum):
     IN_PROGRESS = "in_progress"
     RED_TESTS = "red_tests"
     GREEN_IMPL = "green_impl"
+    REFACTOR = "refactor"
     REVIEW = "review"
     DONE = "done"
     BLOCKED = "blocked"
@@ -144,6 +145,7 @@ class AgentConfig(BaseModel):
     model_a: str = "anthropic/claude-3-5-sonnet-20241022"
     model_b: str = "gemini/gemini-2.5-flash"
     max_turns_per_story: int = 20
+    max_refactor_attempts: int = 3
     sandbox_dir: str = "./sandbox_workspace"
     timeout_seconds: int = 60
     max_output_chars: int = 8000

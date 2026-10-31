@@ -14,8 +14,10 @@ class EventType(str, Enum):
     # Sprint Lifecycle
     SPRINT_START = "sprint:start"
     SPRINT_COMPLETE = "sprint:complete"
+    BACKLOG_DECOMPOSED = "sprint:backlog_decomposed"
     STORY_START = "story:start"
     STORY_STATUS_CHANGE = "story:status_change"
+    REFACTOR_ITERATION = "story:refactor_iteration"
     STORY_DONE = "story:done"
 
     # Multi-Model Collaboration
@@ -42,6 +44,7 @@ class EventType(str, Enum):
     OPERATOR_PAUSE = "operator:pause"
     OPERATOR_STEER = "operator:steer"
     OPERATOR_RESUME = "operator:resume"
+    OPERATOR_STOP = "operator:stop"
 
     # Diagnostics
     ERROR = "system:error"

@@ -302,7 +302,8 @@ To keep the codebase maintainable and robust, all contributors must observe thes
 | `src/sandbox/git_manager.py` | 295 | **100% Custom** | Phase 4: EventBus-driven Git manager with outside-sandbox repository isolation, Conventional Commits, model attribution, and `--no-ff` merges. |
 | `src/gateway/client.py` | 182 | **Hybrid** | Custom direct REST caller for OpenAI-compatible/vendor endpoints, with optional passthrough to **LiteLLM**. |
 | `src/gateway/mock.py` | 50 | **100% Custom** | Scripted response FIFO queue for zero-cost offline test execution. |
-| `src/tui/app.py` | 177 | **Library-Driven** | Custom multi-pane dashboard layout and event stream built on the open-source **`rich`** toolkit. |
+| `src/tui/app.py` | 440 | **Library-Driven** | Custom multi-pane dashboard layout and event stream built on the open-source **`rich`** toolkit. |
+| `src/tui/keyboard.py` | 210 | **100% Custom** | Non-blocking terminal keyboard controller (`msvcrt`/`select`) for live pause, inline steering, diff inspection, and clean exit. |
 | `src/server/bridge.py` | 88 | **100% Custom** | WebSocket client queue broadcaster and operator-steering ingestion pipeline. |
 | `main.py` | 174 | **100% Custom** | CLI argument parser, demo sprint driver, and live lifecycle runner. |
 | `tests/*.py` (9 files) | 608 | **100% Custom** | 27 automated unit and integration tests written using standard library `unittest`. |
@@ -319,6 +320,7 @@ To keep the codebase maintainable and robust, all contributors must observe thes
 | **Phase 2** | React + Vite Split-Pane Web Collaboration Studio | `frontend/` + `src/server/bridge.py` | *(Delivered)* |
 | **Phase 3** | Docker / MicroVM Container Driver | `src/sandbox/docker_runner.py` | *(Delivered)* |
 | **Phase 4** | Automated Conventional Git Branching & Merging | `src/sandbox/git_manager.py` | *(Delivered)* |
+| **Phase 5** | Product Owner Epic Decomposition, Self-Healing Refactor Loop & Terminal Keyboard Controller | `src/agile/backlog.py`, `src/agile/pair_engine.py`, `src/tui/keyboard.py` | *(Delivered)* |
 
 ---
 
