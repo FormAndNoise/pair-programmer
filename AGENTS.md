@@ -61,7 +61,8 @@ main.py
 |---|---|
 | `src/agent_core/types.py` | All domain contracts (Pydantic models). The authoritative source for `UserStory`, `ToolCall`, `Message`, `DefinitionOfDone`, etc. No business logic. |
 | `src/agent_core/events.py` | `EventBus` + `EventType` enum + `AgentEvent`. All inter-module communication goes through here. |
-| `src/agile/backlog.py` | `BacklogManager`: story creation, LLM epic decomposition, DoD verification (runs `compileall` + `python -m unittest` in sandbox). |
+| `src/agile/backlog.py` | `BacklogManager`: story creation, LLM epic decomposition, DoD verification (runs `compileall` + `python -m unittest` + the Outside-In UX audit in sandbox). |
+| `src/agile/ux_evaluator.py` | `OutsideInUXEvaluator`: replays each story's `human_interaction_contract` against sandbox artifacts; the real fourth DoD gate. |
 | `src/agile/pair_engine.py` | `PairProgrammingEngine`: the TDD state machine, role rotation, refactor loop, operator pause/stop/steer. |
 | `src/gateway/client.py` | `ModelGateway`: unified LLM caller. Prefers LiteLLM if installed; falls back to direct native routes: Anthropic Messages API, Gemini generateContent API, or OpenAI-compatible endpoint (all via `httpx`). |
 | `src/gateway/mock.py` | `ScriptedMockGateway`: FIFO queue of pre-scripted responses per model name. Used in all tests. |
@@ -143,7 +144,7 @@ Before any story is closed, all four gates must pass:
 1. `python -m compileall -q .` exits 0 in the sandbox.
 2. `python -m unittest` exits 0 in the sandbox.
 3. The non-author model's response contains `LGTM`.
-4. `ux_verified=True` (currently always set to `True` by the engine; future UX audit hook).
+4. The Outside-In UX contract audit passes. `BacklogManager.verify_dod()` runs `OutsideInUXEvaluator` (from `src/agile/ux_evaluator.py`) against the sandbox artifacts; gated by `AgentConfig.require_ux_audit` (default `True`).
 
 ## Frontend
 
