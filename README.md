@@ -246,6 +246,8 @@ npm run dev
 
 Open the local Vite address shown in the terminal. The studio lets you define a sprint goal, an initial user story, its human interaction contract, and acceptance checks. It streams sprint events live and supports pause, resume, and operator guidance. The API defaults to `http://127.0.0.1:8000`.
 
+> **Frontend build artifacts are dev-only.** The Vite dev server serves the studio; the built `frontend/dist/` is a local dev artifact, is gitignored, and is not served by the FastAPI backend. It is not a shipped artifact.
+
 ---
 
 ## 6. Engineering Standards & Contribution Rules

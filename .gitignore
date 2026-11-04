@@ -45,7 +45,8 @@ sessions/
 sandbox_workspace/
 .pair_programmer_git/
 
-# Frontend dependencies and build metadata
+# Frontend dependencies and local dev build artifacts (dev-only; the FastAPI
+# backend does not serve frontend/dist, which is gitignored by design).
 frontend/node_modules/
 frontend/dist/
 frontend/*.tsbuildinfo
