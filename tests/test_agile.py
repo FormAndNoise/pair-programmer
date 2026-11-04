@@ -41,7 +41,7 @@ class TestAgilePairEngine(unittest.TestCase):
         backlog_mgr = BacklogManager.from_epic("Create Math Module")
         story = backlog_mgr.add_story(
             title="Addition Function",
-            human_interaction_contract="Function `add(a, b)` returns the arithmetic sum.",
+            human_interaction_contract="`add(2, 3)` returns `5`.",
             acceptance_criteria=["add(2, 3) == 5", "add(-1, 1) == 0"],
         )
 
@@ -116,6 +116,40 @@ class TestAgilePairEngine(unittest.TestCase):
         self.assertIn(EventType.CRITIQUE_RECEIVED, events_captured)
         self.assertIn(EventType.DOD_EVALUATION, events_captured)
         self.assertIn(EventType.STORY_DONE, events_captured)
+
+    def test_dod_ux_gate_runs_outside_in_evaluator(self):
+        """The fourth DoD gate runs the Outside-In UX evaluator and rejects contract mismatches."""
+        backlog_mgr = BacklogManager.from_epic("Math Module")
+        story = backlog_mgr.add_story(
+            title="Addition Function",
+            human_interaction_contract="`add(2, 3)` returns `99`.",
+        )
+        # Valid impl (returns 5) + passing test, so only the UX gate can fail.
+        (self.workspace / "math_mod.py").write_text(
+            "def add(a: int, b: int) -> int:\n    return a + b\n", encoding="utf-8"
+        )
+        (self.workspace / "test_math.py").write_text(
+            "import unittest\n"
+            "from math_mod import add\n"
+            "class TestMath(unittest.TestCase):\n"
+            "    def test_add(self):\n"
+            "        self.assertEqual(add(2, 3), 5)\n"
+            "if __name__ == '__main__': unittest.main()\n",
+            encoding="utf-8",
+        )
+
+        dod = backlog_mgr.verify_dod(story, self.runner, cross_review_approved=True, require_ux_audit=True)
+        self.assertFalse(dod.user_experience_verified)
+        self.assertFalse(dod.is_complete)
+
+        # Bypassing the UX gate completes the story.
+        story2 = backlog_mgr.add_story(
+            title="Addition Bypass",
+            human_interaction_contract="`add(2, 3)` returns `99`.",
+        )
+        dod2 = backlog_mgr.verify_dod(story2, self.runner, cross_review_approved=True, require_ux_audit=False)
+        self.assertTrue(dod2.user_experience_verified)
+        self.assertTrue(dod2.is_complete)
 
 
 if __name__ == "__main__":

@@ -242,7 +242,7 @@ class PairProgrammingEngine:
             story=story,
             runner=self.runner,
             cross_review_approved=is_approved,
-            ux_verified=True,
+            require_ux_audit=self.config.require_ux_audit,
         )
 
         refactor_attempt = 0
@@ -313,7 +313,7 @@ class PairProgrammingEngine:
                 story=story,
                 runner=self.runner,
                 cross_review_approved=is_approved,
-                ux_verified=True,
+                require_ux_audit=self.config.require_ux_audit,
             )
 
         self.bus.publish(

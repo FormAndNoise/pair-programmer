@@ -70,7 +70,7 @@ class TestOperatorSteeringSimulation(unittest.TestCase):
             runner = SandboxRunner(workspace)
             registry = ToolRegistry(runner)
             gateway = ScriptedMockGateway()
-            config = AgentConfig(model_a="claude-3-5", model_b="gemini-2-5")
+            config = AgentConfig(model_a="claude-3-5", model_b="gemini-2-5", require_ux_audit=False)
 
             backlog = BacklogManager.from_epic("Steering Test")
             story = backlog.add_story(

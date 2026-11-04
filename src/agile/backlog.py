@@ -8,6 +8,7 @@ from typing import Any, List, Optional
 from agent_core.events import AgentEvent, EventBus, EventType
 from agent_core.types import DefinitionOfDone, Message, Role, SprintBacklog, StoryStatus, UserStory
 from sandbox.runner import SandboxRunner
+from agile.ux_evaluator import OutsideInUXEvaluator
 
 
 class BacklogManager:
@@ -181,9 +182,15 @@ class BacklogManager:
         runner: SandboxRunner,
         test_command: str = "python -m unittest",
         cross_review_approved: bool = False,
-        ux_verified: bool = True,
+        require_ux_audit: bool = True,
     ) -> DefinitionOfDone:
-        """Evaluate the Definition of Done (DoD) quality gate."""
+        """Evaluate the Definition of Done (DoD) quality gate.
+
+        Runs the four gates in order: syntax check, sandbox tests, cross-model
+        review, and the Outside-In UX contract audit. The UX audit replays the
+        story human_interaction_contract against the sandbox artifacts and is
+        enabled when require_ux_audit is True.
+        """
         # 1. Syntax check
         syntax_res = runner.run_command("python -m compileall -q .")
         syntax_valid = syntax_res.is_success
@@ -199,9 +206,17 @@ class BacklogManager:
         if not tests_passed:
             failure_notes.append(f"Test suite failed:\n{test_res.format_output()}")
 
+        # 4. Outside-In UX contract audit (the real fourth gate)
+        ux_verified = True
+        if require_ux_audit:
+            scorecard = OutsideInUXEvaluator(runner).evaluate_story_contract(story)
+            ux_verified = scorecard.passed
+            if not ux_verified:
+                failure_notes.append(f"UX contract not satisfied:\n{scorecard.feedback}")
+
         notes = "\n\n".join(failure_notes) if failure_notes else "All verification checks passed."
 
-        # 4. Update DoD status
+        # 5. Update DoD status
         dod = DefinitionOfDone(
             syntax_valid=syntax_valid,
             tests_passed=tests_passed,
