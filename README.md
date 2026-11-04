@@ -80,7 +80,7 @@ During design and implementation, several deliberate departures were made from i
 
 ### 5. Zero-Bloat Dependency Discipline
 * **Original Idea**: Pull in heavy agent frameworks (LangChain, AutoGen, CrewAI).
-* **Deviation**: Built a lightweight, modular engine directly on Python 3.11+ primitives. Testing uses Python's built-in `unittest` module (27 tests run in under 6 seconds with zero external test runner overhead).
+* **Deviation**: Built a lightweight, modular engine directly on Python 3.11+ primitives. Testing uses Python's built-in `unittest` module (99 tests run in under 65 seconds with zero external test runner overhead).
 
 ---
 
@@ -185,7 +185,7 @@ $env:PYTHONPATH="src" ; python -m unittest discover tests
 
 Expected output:
 ```text
-Ran 27 tests in ~5.9s
+Ran 99 tests in ~60s
 OK
 ```
 
@@ -207,6 +207,12 @@ To execute sandbox commands inside an isolated Docker container:
 python main.py --mock --docker
 ```
 
+To run the complete automated UX simulation and scorecard:
+
+```bash
+python main.py --simulate-ux
+```
+
 Watch the terminal:
 * **Model A** writes failing tests.
 * **Model B** implements the functions to turn the tests green.
@@ -219,6 +225,13 @@ To launch a live coding sprint with real LLMs:
 
 ```bash
 python main.py --epic "Build a command-line markdown to HTML converter"
+```
+
+By default the Product Owner LLM decomposes the epic into up to 3 stories. Control decomposition with `--max-stories N`, or skip it with `--no-decompose` to use a single default story:
+
+```bash
+python main.py --epic "..." --max-stories 5
+python main.py --epic "..." --no-decompose
 ```
 
 ### 6. Run the Phase 2 Web Collaboration Studio
@@ -235,6 +248,8 @@ Start the API and model pair in one terminal:
 ```powershell
 cd "c:\Users\Aarik\Desktop\pair programmer"
 python main.py --web --epic "Build a command-line markdown to HTML converter"
+
+Customize the API host and port with `--web-host` and `--web-port` (defaults: `127.0.0.1:8000`):
 ```
 
 Start the React studio in a second terminal:
@@ -308,7 +323,7 @@ To keep the codebase maintainable and robust, all contributors must observe thes
 | `src/tui/keyboard.py` | 210 | **100% Custom** | Non-blocking terminal keyboard controller (`msvcrt`/`select`) for live pause, inline steering, diff inspection, and clean exit. |
 | `src/server/bridge.py` | 88 | **100% Custom** | WebSocket client queue broadcaster and operator-steering ingestion pipeline. |
 | `main.py` | 174 | **100% Custom** | CLI argument parser, demo sprint driver, and live lifecycle runner. |
-| `tests/*.py` (9 files) | 608 | **100% Custom** | 27 automated unit and integration tests written using standard library `unittest`. |
+| `tests/*.py` (9 files) | 608 | **100% Custom** | 99 automated unit and integration tests written using standard library `unittest`. |
 
 *Summary*: 100% of the repository's lines were written specifically for this codebase, while ~35% of the architectural patterns were adapted from proven open-source solutions. Runtime dependencies include `rich`, `pydantic`, `litellm`, `python-dotenv`, `fastapi`, and `uvicorn`. The web studio uses `react`, `react-dom`, `vite`, and `typescript`.
 
