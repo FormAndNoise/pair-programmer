@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import os
+import socket
 import sys
 import time
 from pathlib import Path
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.live import Live
+from rich.text import Text
 
 # Ensure src is on sys.path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
@@ -26,6 +29,47 @@ from sandbox.git_manager import GitManager
 from tools.registry import ToolRegistry
 from tui.app import PairProgrammingTUI
 from tui.keyboard import TerminalKeyboardController
+from agent_core.sanitize import strip_ansi
+
+
+def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    """Read and validate an integer environment setting."""
+    raw_value = os.getenv(name, str(default))
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        raise SystemExit(
+            f"Invalid {name}={strip_ansi(raw_value)!r}; expected an integer from {minimum} to {maximum}."
+        ) from None
+    if not minimum <= value <= maximum:
+        raise SystemExit(
+            f"Invalid {name}={value}; expected a value from {minimum} to {maximum}."
+        )
+    return value
+
+
+def _loopback_bind_host(host: str) -> str | None:
+    """Return a resolved loopback address, or None when the host is remote."""
+    normalized = host.strip().strip("[]").rstrip(".").lower()
+    if normalized == "localhost":
+        return "127.0.0.1"
+    try:
+        address = ipaddress.ip_address(normalized)
+        return str(address) if address.is_loopback else None
+    except ValueError:
+        pass
+
+    try:
+        resolved = {
+            ipaddress.ip_address(info[4][0].split("%", 1)[0])
+            for info in socket.getaddrinfo(normalized, None, type=socket.SOCK_STREAM)
+        }
+    except (OSError, ValueError):
+        return None
+    if resolved and all(address.is_loopback for address in resolved):
+        selected = sorted(resolved, key=lambda address: (address.version, int(address)))[0]
+        return str(selected)
+    return None
 
 
 def _build_runner(args, sandbox_path: Path) -> SandboxRunner | DockerSandboxRunner:
@@ -34,16 +78,29 @@ def _build_runner(args, sandbox_path: Path) -> SandboxRunner | DockerSandboxRunn
     Reads SANDBOX_MODE from the environment when --docker is not specified.
     Prints the selected mode to stderr so the user sees it on startup.
     """
-    use_docker = args.docker or os.getenv("SANDBOX_MODE", "local_process") == "docker"
+    timeout = _bounded_env_int("SANDBOX_TIMEOUT_SECONDS", 60, 1, 600)
+    max_output = _bounded_env_int("SANDBOX_MAX_OUTPUT_CHARS", 8000, 100, 100_000)
+    sandbox_mode = os.getenv("SANDBOX_MODE", "local_process").strip().lower()
+    if sandbox_mode not in {"local_process", "docker"}:
+        raise SystemExit(
+            f"Invalid SANDBOX_MODE={strip_ansi(sandbox_mode)!r}; expected 'local_process' or 'docker'."
+        )
+    use_docker = args.docker or sandbox_mode == "docker"
     if use_docker:
         runner = DockerSandboxRunner(
             workspace_dir=sandbox_path,
+            default_timeout_seconds=timeout,
+            max_output_chars=max_output,
             image=os.getenv("SANDBOX_IMAGE", "python:3.11-slim"),
         )
-        print(f"[Sandbox] Mode: Docker  image={runner.image}  workspace={sandbox_path}")
+        print(strip_ansi(f"[Sandbox] Mode: Docker  image={runner.image}  workspace={sandbox_path}"))
     else:
-        runner = SandboxRunner(workspace_dir=sandbox_path)
-        print(f"[Sandbox] Mode: local_process  workspace={sandbox_path}")
+        runner = SandboxRunner(
+            workspace_dir=sandbox_path,
+            default_timeout_seconds=timeout,
+            max_output_chars=max_output,
+        )
+        print(strip_ansi(f"[Sandbox] Mode: local_process  workspace={sandbox_path}"))
     return runner
 
 
@@ -62,7 +119,7 @@ def _attach_git_manager(console: Console, bus: EventBus, sandbox_path: Path) -> 
         bus=bus,
         base_branch=os.getenv("GIT_BASE_BRANCH", "main"),
     )
-    console.print(f"[Git] Automation on  base={manager.base_branch}  git_dir={manager.git_dir}")
+    console.print(Text(strip_ansi(f"[Git] Automation on  base={manager.base_branch}  git_dir={manager.git_dir}")))
     return manager
 
 
@@ -71,19 +128,13 @@ def run_demo_mock_sprint(console: Console, sandbox_dir: Path, use_docker: bool =
     bus = EventBus()
     tui = PairProgrammingTUI(bus=bus, console=console)
     git_mgr = _attach_git_manager(console, bus, sandbox_dir) if use_git else None
-    if use_docker:
-        runner = DockerSandboxRunner(
-            workspace_dir=sandbox_dir,
-            image=os.getenv("SANDBOX_IMAGE", "python:3.11-slim"),
-        )
-    else:
-        runner = SandboxRunner(sandbox_dir)
+    runner = _build_runner(argparse.Namespace(docker=use_docker), sandbox_dir)
     registry = ToolRegistry(runner)
     mock_gateway = ScriptedMockGateway()
 
     config = AgentConfig(
         model_a="anthropic/claude-3-5-sonnet",
-        model_b="gemini/gemini-2-5-flash",
+        model_b="gemini/gemini-2.5-flash",
         sandbox_dir=str(sandbox_dir),
     )
 
@@ -187,7 +238,7 @@ def run_demo_mock_sprint(console: Console, sandbox_dir: Path, use_docker: bool =
         time.sleep(1)
 
     console.print("\n[bold green]Sprint Execution Finished Successfully![/]")
-    console.print(f"Artifacts written to sandbox: [cyan]{sandbox_dir}[/]\n")
+    console.print(Text(strip_ansi(f"Artifacts written to sandbox: {sandbox_dir}\n")))
 
 
 def main() -> None:
@@ -206,12 +257,33 @@ def main() -> None:
     parser.add_argument("--web", action="store_true", help="Run the browser collaboration studio API")
     parser.add_argument("--web-host", type=str, default="127.0.0.1", help="Host for the web API")
     parser.add_argument("--web-port", type=int, default=8000, help="Port for the web API")
+    parser.add_argument(
+        "--insecure-remote",
+        action="store_true",
+        help="Allow the authenticated web API to bind to a non-loopback interface.",
+    )
     parser.add_argument("--model-a", type=str, default=os.getenv("MODEL_A", "anthropic/claude-3-5-sonnet"))
-    parser.add_argument("--model-b", type=str, default=os.getenv("MODEL_B", "gemini/gemini-2-5-flash"))
+    parser.add_argument("--model-b", type=str, default=os.getenv("MODEL_B", "gemini/gemini-2.5-flash"))
     parser.add_argument("--sandbox", type=str, default="./sandbox_workspace", help="Path to isolated sandbox workspace")
 
     args = parser.parse_args()
     sandbox_path = Path(args.sandbox).resolve()
+
+    if args.web:
+        loopback_host = _loopback_bind_host(args.web_host)
+        if loopback_host is not None:
+            args.web_host = loopback_host
+        else:
+            warning = Text(
+                "SECURITY WARNING: the web API will be reachable from remote devices. "
+                "Use only on a trusted network; remote access needs the bearer token.",
+                style="bold white on red",
+            )
+            console.print(warning)
+            if not args.insecure_remote:
+                raise SystemExit(
+                    "Refusing remote web bind. Pass --insecure-remote to acknowledge this exposure."
+                )
 
     if args.simulate_ux:
         from tests.ux_simulation.run_simulation import execute_desktop_ai_simulation
@@ -227,9 +299,9 @@ def main() -> None:
 
     # Live Mode
     console.print("[bold cyan]Dual-Model Pair Programming Agent[/]")
-    console.print(f"Model A (Driver/Test): [green]{args.model_a}[/]")
-    console.print(f"Model B (Navigator/Impl): [green]{args.model_b}[/]")
-    console.print(f"Contained Sandbox: [green]{sandbox_path}[/]\n")
+    console.print(Text.assemble(("Model A (Driver/Test): ", ""), (strip_ansi(args.model_a), "green")))
+    console.print(Text.assemble(("Model B (Navigator/Impl): ", ""), (strip_ansi(args.model_b), "green")))
+    console.print(Text.assemble(("Contained Sandbox: ", ""), (strip_ansi(str(sandbox_path)), "green"), ("\n", "")))
 
     bus = EventBus()
     tui = PairProgrammingTUI(bus=bus, console=console)
@@ -279,8 +351,8 @@ def main() -> None:
         web_app = create_fastapi_app(WebEventBridge(bus), engine)
         if web_app is None:
             raise SystemExit("Web mode requires FastAPI. Install the project dependencies first.")
-        console.print(f"[bold cyan]Pair Programming Web Studio API[/] at http://{args.web_host}:{args.web_port}")
-        console.print(f"Epic: [green]{args.epic}[/]")
+        console.print(Text.assemble(("Pair Programming Web Studio API at ", "bold cyan"), (strip_ansi(f"http://{args.web_host}:{args.web_port}"), "")))
+        console.print(Text.assemble(("Epic: ", ""), (strip_ansi(args.epic), "green")))
         console.print("Start the Vite frontend in a second terminal with `cd frontend; npm run dev`.\n")
         uvicorn.run(web_app, host=args.web_host, port=args.web_port)
         return

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 from agent_core.events import AgentEvent, EventBus, EventType
 from agent_core.types import DefinitionOfDone, Message, Role, SprintBacklog, StoryStatus, UserStory
 from sandbox.runner import SandboxRunner
-from agile.ux_evaluator import OutsideInUXEvaluator
+from agile.ux_evaluator import OutsideInUXEvaluator, build_sandbox_python_env
 
 
 class BacklogManager:
@@ -176,6 +177,23 @@ class BacklogManager:
 
         return []
 
+    @staticmethod
+    def snapshot_test_hashes(runner: SandboxRunner) -> Dict[str, str]:
+        """Compute SHA256 hashes of all test files in the sandbox workspace."""
+        hashes: Dict[str, str] = {}
+        workspace = runner.workspace_dir
+        tests_dir = workspace / "tests"
+        if tests_dir.is_dir():
+            for p in sorted(tests_dir.rglob("*.py")):
+                if p.is_file():
+                    rel = p.relative_to(workspace).as_posix()
+                    hashes[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in sorted(workspace.glob("test*.py")):
+            if p.is_file():
+                rel = p.relative_to(workspace).as_posix()
+                hashes[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
+        return hashes
+
     def verify_dod(
         self,
         story: UserStory,
@@ -183,30 +201,84 @@ class BacklogManager:
         test_command: str = "python -m unittest",
         cross_review_approved: bool = False,
         require_ux_audit: bool = True,
+        require_docker_runner: bool = False,
     ) -> DefinitionOfDone:
         """Evaluate the Definition of Done (DoD) quality gate.
 
-        Runs the four gates in order: syntax check, sandbox tests, cross-model
-        review, and the Outside-In UX contract audit. The UX audit replays the
-        story human_interaction_contract against the sandbox artifacts and is
-        enabled when require_ux_audit is True.
+        Runs the quality gates in order: docker runner verification (if required),
+        harness smoke test, syntax check, sandbox test suite (with test pinning
+        integrity validation), cross-model review, and Outside-In UX contract audit.
         """
-        # 1. Syntax check
-        syntax_res = runner.run_command("python -m compileall -q .")
-        syntax_valid = syntax_res.is_success
-
-        # 2. Automated test run
-        test_res = runner.run_command(test_command)
-        tests_passed = test_res.is_success
-
-        # 3. Diagnostic notes for self-healing refactor loops
         failure_notes: List[str] = []
+
+        # 0. Docker runner verification if demanded
+        if require_docker_runner:
+            is_docker = runner.__class__.__name__ == "DockerSandboxRunner"
+            if not is_docker:
+                failure_notes.append("Definition of Done requires execution inside DockerSandboxRunner.")
+                dod = DefinitionOfDone(
+                    syntax_valid=False,
+                    tests_passed=False,
+                    cross_review_approved=cross_review_approved,
+                    user_experience_verified=False,
+                    notes="\n\n".join(failure_notes),
+                )
+                story.dod = dod
+                return dod
+
+        # 1. Harness-owned smoke test outside agent-writable tests/
+        py_env = build_sandbox_python_env(runner)
+        smoke_res = runner.run_command("python -c \"import sys, unittest; sys.exit(0)\"", trusted_env=py_env)
+        smoke_ok = smoke_res.is_success
+        if not smoke_ok:
+            failure_notes.append(f"Harness environment smoke check failed:\n{smoke_res.format_output()}")
+
+        # 2. Syntax check
+        syntax_res = runner.run_command("python -m compileall -q .", trusted_env=py_env)
+        syntax_valid = syntax_res.is_success and smoke_ok
         if not syntax_valid:
             failure_notes.append(f"Syntax check failed:\n{syntax_res.format_output()}")
-        if not tests_passed:
+
+        # 3. Test pinning integrity check (assert tests were not tampered with post-RED)
+        test_tampered = False
+        if story.pinned_test_hashes is not None:
+            current_hashes = self.snapshot_test_hashes(runner)
+            if current_hashes != story.pinned_test_hashes:
+                test_tampered = True
+                failure_notes.append(
+                    "Test suite integrity check failed: tests were modified, added, or deleted after the RED phase."
+                )
+
+        # 4. Automated test run (supporting both tests/ + src/ and flat workspace layouts)
+        tests_dir = runner.workspace_dir / "tests"
+        has_tests_dir = tests_dir.is_dir() and any(tests_dir.rglob("test*.py"))
+        has_root_tests = any(p.is_file() for p in runner.workspace_dir.glob("test*.py"))
+
+        if test_command == "python -m unittest" and has_tests_dir and not has_root_tests:
+            test_res = runner.run_command("python -m unittest discover -s tests", trusted_env=py_env)
+        elif (
+            test_command == "python -m unittest"
+            and has_tests_dir
+            and has_root_tests
+            and not (tests_dir / "__init__.py").exists()
+        ):
+            root_res = runner.run_command("python -m unittest", trusted_env=py_env)
+            sub_res = runner.run_command("python -m unittest discover -s tests", trusted_env=py_env)
+            test_res = root_res if not root_res.is_success else sub_res
+        else:
+            test_res = runner.run_command(test_command, trusted_env=py_env)
+
+        no_tests_ran = "Ran 0 tests" in f"{test_res.stdout}\n{test_res.stderr}"
+        tests_passed = test_res.is_success and not no_tests_ran and not test_tampered and smoke_ok
+
+        if no_tests_ran:
+            failure_notes.append(
+                f"Test suite failed: No unit tests were discovered or executed.\n{test_res.format_output()}"
+            )
+        elif not test_res.is_success:
             failure_notes.append(f"Test suite failed:\n{test_res.format_output()}")
 
-        # 4. Outside-In UX contract audit (the real fourth gate)
+        # 5. Outside-In UX contract audit (the real fourth gate)
         ux_verified = True
         if require_ux_audit:
             scorecard = OutsideInUXEvaluator(runner).evaluate_story_contract(story)
@@ -216,7 +288,7 @@ class BacklogManager:
 
         notes = "\n\n".join(failure_notes) if failure_notes else "All verification checks passed."
 
-        # 5. Update DoD status
+        # 6. Update DoD status
         dod = DefinitionOfDone(
             syntax_valid=syntax_valid,
             tests_passed=tests_passed,

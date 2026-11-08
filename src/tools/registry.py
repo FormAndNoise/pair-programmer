@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import uuid
 from typing import Any, Callable, Dict, List, Optional
 from agent_core.types import ToolDefinition, ToolResult
 from sandbox.runner import SandboxRunner
@@ -43,12 +44,13 @@ class ToolRegistry:
         self,
         name: str,
         arguments: Dict[str, Any],
-        call_id: str = "",
+        call_id: Optional[str] = None,
     ) -> ToolResult:
         """Execute a tool by name with provided arguments."""
+        cid = (call_id or "").strip() or f"call_{uuid.uuid4().hex}"
         if name not in self._tools:
             return ToolResult(
-                call_id=call_id,
+                call_id=cid,
                 name=name,
                 output=f"Error: Tool '{name}' is not recognized. Available tools: {list(self._tools.keys())}",
                 is_error=True,
@@ -56,31 +58,35 @@ class ToolRegistry:
 
         handler = self._tools[name]
         try:
-            # Bind sandbox runner if first parameter expects it
             sig = inspect.signature(handler)
+            call_kwargs = dict(arguments)
+            if "call_id" in sig.parameters and "call_id" not in call_kwargs:
+                call_kwargs["call_id"] = cid
+
+            # Bind sandbox runner if first parameter expects it
             first_param = next(iter(sig.parameters.values()), None)
             if first_param and (
                 first_param.name == "runner"
                 or first_param.annotation is SandboxRunner
             ):
-                result = handler(self.runner, **arguments)
+                result = handler(self.runner, **call_kwargs)
             else:
-                result = handler(**arguments)
+                result = handler(**call_kwargs)
 
-            result.call_id = call_id
+            result.call_id = cid
             result.name = name
             return result
 
         except TypeError as e:
             return ToolResult(
-                call_id=call_id,
+                call_id=cid,
                 name=name,
                 output=f"Invalid arguments for tool '{name}': {e}",
                 is_error=True,
             )
         except Exception as e:
             return ToolResult(
-                call_id=call_id,
+                call_id=cid,
                 name=name,
                 output=f"Execution exception in tool '{name}': {e}",
                 is_error=True,

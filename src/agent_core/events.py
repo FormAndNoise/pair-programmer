@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 import uuid
+from collections import deque
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional
 from pydantic import BaseModel, Field
+from agent_core.sanitize import strip_ansi
 
 
 class EventType(str, Enum):
@@ -60,6 +63,7 @@ class AgentEvent(BaseModel):
 
 
 EventHandler = Callable[[AgentEvent], Any]
+MAX_EVENT_HISTORY = 1000
 
 
 class EventBus:
@@ -68,46 +72,68 @@ class EventBus:
     def __init__(self) -> None:
         self._handlers: Dict[EventType, List[EventHandler]] = {}
         self._wildcard_handlers: List[EventHandler] = []
-        self._history: List[AgentEvent] = []
+        self._history: Deque[AgentEvent] = deque(maxlen=MAX_EVENT_HISTORY)
+        self._total_events = 0
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _schedule_coroutine(res: Any) -> None:
+        """Schedule a coroutine on the running loop, or close it if none is running.
+
+        Never calls asyncio.create_task from a foreign thread, which would
+        raise RuntimeError (no running loop in that thread).
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            res.close()
+            return
+        loop.create_task(res)
 
     def subscribe(self, event_type: EventType, handler: EventHandler) -> None:
         """Subscribe to a specific event type."""
-        if event_type not in self._handlers:
-            self._handlers[event_type] = []
-        self._handlers[event_type].append(handler)
+        with self._lock:
+            self._handlers.setdefault(event_type, []).append(handler)
 
     def subscribe_all(self, handler: EventHandler) -> None:
         """Subscribe to all events (useful for loggers, UI event streams, WebSockets)."""
-        self._wildcard_handlers.append(handler)
+        with self._lock:
+            self._wildcard_handlers.append(handler)
 
     def publish(self, event: AgentEvent) -> None:
         """Publish an event synchronously to all registered listeners."""
-        self._history.append(event)
+        with self._lock:
+            self._history.append(event)
+            self._total_events += 1
+            handlers = list(self._handlers.get(event.event_type, []))
+            wildcard_handlers = list(self._wildcard_handlers)
 
-        # Notify specific listeners
-        for handler in self._handlers.get(event.event_type, []):
-            try:
-                res = handler(event)
-                if asyncio.iscoroutine(res):
-                    asyncio.create_task(res)
-            except Exception as e:
-                print(f"[EventBus] Error in handler {handler}: {e}")
+        def _dispatch(handler_list, context: str) -> None:
+            for handler in handler_list:
+                try:
+                    res = handler(event)
+                    if asyncio.iscoroutine(res):
+                        self._schedule_coroutine(res)
+                except Exception as e:
+                    print(strip_ansi(f"[EventBus] Error in {context} handler {handler}: {e}"))
 
-        # Notify wildcard listeners
-        for handler in self._wildcard_handlers:
-            try:
-                res = handler(event)
-                if asyncio.iscoroutine(res):
-                    asyncio.create_task(res)
-            except Exception as e:
-                print(f"[EventBus] Error in wildcard handler: {e}")
+        _dispatch(handlers, "specific")
+        _dispatch(wildcard_handlers, "wildcard")
 
     def get_history(self) -> List[AgentEvent]:
         """Return full event timeline."""
-        return list(self._history)
+        with self._lock:
+            return list(self._history)
+
+    def get_total_event_count(self) -> int:
+        """Return the number of events published since the last clear."""
+        with self._lock:
+            return self._total_events
 
     def clear(self) -> None:
         """Reset handlers and history."""
-        self._handlers.clear()
-        self._wildcard_handlers.clear()
-        self._history.clear()
+        with self._lock:
+            self._handlers.clear()
+            self._wildcard_handlers.clear()
+            self._history.clear()
+            self._total_events = 0

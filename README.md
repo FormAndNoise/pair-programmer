@@ -99,7 +99,9 @@ pair programmer/
 │   │   └── events.py        # Decoupled publish/subscribe EventBus
 │   │
 │   ├── sandbox/             # Contained execution environment
-│   │   └── runner.py        # SandboxRunner (path confinement & watchdog timer)
+│   │   ├── runner.py        # SandboxRunner (path confinement & watchdog timer)
+│   │   ├── docker_runner.py # DockerSandboxRunner (air-gapped container runner)
+│   │   └── git_manager.py   # GitManager (story branches, model commits, merges)
 │   │
 │   ├── tools/               # Deterministic file and terminal primitives
 │   │   ├── primitives.py    # read_file, write_file, patch_file, list_dir, run_command
@@ -111,19 +113,21 @@ pair programmer/
 │   │
 │   ├── agile/               # Extreme Programming & Scrum state machine
 │   │   ├── backlog.py       # BacklogManager (story decomposition & DoD evaluation)
-│   │   └── pair_engine.py   # PairProgrammingEngine (Ping-Pong TDD & role rotation)
+│   │   ├── pair_engine.py   # PairProgrammingEngine (Ping-Pong TDD & role rotation)
+│   │   └── ux_evaluator.py  # OutsideInUXEvaluator (human interaction contracts)
 │   │
-│   ├── tui/                 # Phase 1: Terminal User Interface
-│   │   └── app.py           # Rich dashboard (backlog, color-coded stage, VM log)
+│   ├── tui/                 # Terminal User Interface
+│   │   ├── app.py           # Rich dashboard (backlog, color-coded stage, VM log)
+│   │   └── keyboard.py      # TerminalKeyboardController (non-blocking pause/steer)
 │   │
-│   ├── server/              # Phase 2: Web UI Bridge
+│   ├── server/              # Web UI Bridge
 │   │   └── bridge.py        # WebEventBridge, sprint API, and WebSocket stream
 │
-├── frontend/                # Phase 2: React + Vite collaboration studio
+├── frontend/                # React + Vite collaboration studio
 │   ├── src/App.tsx           # Sprint brief, backlog, activity, and operator controls
 │   └── vite.config.ts        # Local API and WebSocket proxy
 │
-├── tests/                   # Complete automated test suite (27 unit & e2e tests)
+├── tests/                   # Complete automated test suite (118 unit & simulation tests)
 │   ├── test_types.py        # Contract validation and provider format tests
 │   ├── test_events.py       # EventBus subscription & history tests
 │   ├── test_sandbox.py      # Path traversal blocking & timeout watchdog tests
@@ -132,7 +136,8 @@ pair programmer/
 │   ├── test_agile.py        # Single-story TDD cycle with mock LLMs
 │   ├── test_tui.py          # TUI layout and event rendering tests
 │   ├── test_e2e_mock_sprint.py # Multi-story sprint test with role rotation
-│   └── test_server_bridge.py   # WebSocket queue and steering injection tests
+│   ├── test_server_bridge.py   # WebSocket queue and steering injection tests
+│   └── ux_simulation/       # Outside-In evaluator, Docker runner, and TUI simulation
 │
 └── sandbox_workspace/       # Isolated guest directory where agent writes code
 ```
@@ -176,7 +181,7 @@ python -m pip install -e .
 
 ### 3. Run the Automated Test Suite
 
-Before making any code changes, verify that all 27 unit and integration tests pass:
+Before making any code changes, verify that all 118 unit and integration tests pass:
 
 ```powershell
 $env:PYTHONPATH="src" ; python -m unittest discover tests
@@ -185,7 +190,7 @@ $env:PYTHONPATH="src" ; python -m unittest discover tests
 
 Expected output:
 ```text
-Ran 99 tests in ~60s
+Ran 118 tests in ~60s
 OK
 ```
 
@@ -248,9 +253,9 @@ Start the API and model pair in one terminal:
 ```powershell
 cd "c:\Users\Aarik\Desktop\pair programmer"
 python main.py --web --epic "Build a command-line markdown to HTML converter"
-
-Customize the API host and port with `--web-host` and `--web-port` (defaults: `127.0.0.1:8000`):
 ```
+
+Customize the API host and port with `--web-host` and `--web-port` (defaults: `127.0.0.1:8000`).
 
 Start the React studio in a second terminal:
 
@@ -260,6 +265,8 @@ npm run dev
 ```
 
 Open the local Vite address shown in the terminal. The studio lets you define a sprint goal, an initial user story, its human interaction contract, and acceptance checks. It streams sprint events live and supports pause, resume, and operator guidance. The API defaults to `http://127.0.0.1:8000`.
+
+On first launch, the API creates an access token in `~/.pair_programmer/token`. Paste this token into the studio prompt. The studio keeps it in `sessionStorage` for the current browser tab. You can set `PAIR_PROGRAMMER_TOKEN` to use a token from the environment instead.
 
 > **Frontend build artifacts are dev-only.** The Vite dev server serves the studio; the built `frontend/dist/` is a local dev artifact, is gitignored, and is not served by the FastAPI backend. It is not a shipped artifact.
 

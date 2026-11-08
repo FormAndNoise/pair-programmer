@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pair Helper — Easy Mode Mockup</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Andika:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --paper: #FFF9EC;       /* warm cream, like paper */
+    --sky: #4A9FD8;         /* friendly sky blue */
+    --grass: #5CAF50;       /* go / growing green */
+    --sun: #FFC93C;         /* warm yellow */
+    --barn: #E4573D;        /* stop red, soft not alarming */
+    --ink: #3A3226;         /* soft brown-black text */
+    --ink-soft: #7A6F5C;    /* gentle secondary text */
+    --card: #FFFFFF;
+    --line: #EADFC8;
+    --violet: #9B7EDE;      /* the second helper's color */
+    --radius: 20px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: 'Andika', sans-serif;   /* designed for beginning readers */
+    font-size: 20px;
+    line-height: 1.6;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* ---------- Top strip: only the helpers and the weather ---------- */
+  header {
+    display: flex; align-items: center; justify-content: center; gap: 14px;
+    padding: 18px 24px;
+    border-bottom: 3px solid var(--line);
+  }
+  .sun-icon {
+    width: 44px; height: 44px; border-radius: 50%;
+    background: var(--sun);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 24px;
+  }
+  .greeting { font-size: 26px; font-weight: 700; }
+
+  /* ---------- Center: one thing at a time ---------- */
+  main {
+    flex: 1;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    padding: 32px 24px;
+    gap: 32px;
+    max-width: 720px;
+    margin: 0 auto;
+    width: 100%;
+  }
+
+  /* The job card */
+  .job-card {
+    background: var(--card);
+    border: 3px solid var(--line);
+    border-radius: var(--radius);
+    padding: 28px 32px;
+    width: 100%;
+    text-align: center;
+    box-shadow: 0 4px 0 var(--line);
+  }
+  .job-label {
+    font-size: 16px; font-weight: 700; color: var(--ink-soft);
+    text-transform: uppercase; letter-spacing: 0.08em;
+    margin-bottom: 8px;
+  }
+  .job-name { font-size: 30px; font-weight: 700; }
+
+  /* The two helpers */
+  .helpers { display: flex; gap: 24px; }
+  .helper {
+    background: var(--card);
+    border: 3px solid var(--line);
+    border-radius: var(--radius);
+    padding: 20px 28px;
+    display: flex; flex-direction: column; align-items: center; gap: 10px;
+    width: 220px;
+  }
+  .helper.working { border-color: var(--sky); box-shadow: 0 4px 0 var(--sky); }
+  .helper.waiting { opacity: 0.55; }
+  .helper-face {
+    width: 72px; height: 72px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 36px;
+  }
+  .helper.blue .helper-face { background: #E3F1FB; }
+  .helper.violet .helper-face { background: #EFE9FB; }
+  .helper-name { font-size: 22px; font-weight: 700; }
+  .helper-doing { font-size: 17px; color: var(--ink-soft); text-align: center; min-height: 2.4em; }
+  .working-dot {
+    display: inline-block; width: 12px; height: 12px; border-radius: 50%;
+    background: var(--grass); margin-right: 6px;
+  }
+
+  /* What just happened — one friendly sentence */
+  .story-line {
+    font-size: 22px; text-align: center;
+    background: #FDF3D8;
+    border: 3px solid var(--sun);
+    border-radius: var(--radius);
+    padding: 18px 28px;
+    width: 100%;
+  }
+
+  /* The path of jobs */
+  .path { display: flex; align-items: center; gap: 12px; }
+  .step {
+    width: 56px; height: 56px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 26px; border: 3px solid var(--line); background: var(--card);
+    color: var(--ink-soft);
+  }
+  .step.done { background: var(--grass); border-color: var(--grass); color: #fff; }
+  .step.now { background: var(--sun); border-color: var(--sun); color: var(--ink); transform: scale(1.15); }
+  .step-link { width: 28px; height: 4px; background: var(--line); border-radius: 2px; }
+
+  /* The big buttons — the only two things you can press */
+  .buttons { display: flex; gap: 24px; margin-top: 8px; }
+  .big-btn {
+    min-width: 200px; min-height: 72px;
+    border: none; border-radius: 999px;
+    font-family: 'Andika', sans-serif;
+    font-size: 26px; font-weight: 700;
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center; gap: 12px;
+    color: #fff;
+  }
+  .big-btn.pause { background: var(--sun); color: var(--ink); }
+  .big-btn.stop { background: var(--barn); }
+  .big-btn:focus-visible { outline: 5px solid var(--sky); outline-offset: 4px; }
+
+  /* Footer: one honest line */
+  footer {
+    text-align: center;
+    padding: 16px;
+    font-size: 17px;
+    color: var(--ink-soft);
+    border-top: 3px solid var(--line);
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="sun-icon">&#9728;</span>
+  <span class="greeting">Your helpers are working</span>
+</header>
+
+<main>
+  <!-- The job being done -->
+  <div class="job-card">
+    <div class="job-label">The big job</div>
+    <div class="job-name">Making a Word Tool</div>
+  </div>
+
+  <!-- The two helpers -->
+  <div class="helpers">
+    <div class="helper blue working">
+      <div class="helper-face">&#129302;</div>
+      <div class="helper-name">Blue</div>
+      <div class="helper-doing"><span class="working-dot"></span>Writing a check</div>
+    </div>
+    <div class="helper violet waiting">
+      <div class="helper-face">&#129312;</div>
+      <div class="helper-name">Violet</div>
+      <div class="helper-doing">Waiting for a turn</div>
+    </div>
+  </div>
+
+  <!-- What just happened, in one sentence -->
+  <div class="story-line">
+    Blue wrote a check to make sure the word counter works. Violet will build it next.
+  </div>
+
+  <!-- The path: 3 jobs, 1 done -->
+  <div class="path" aria-label="Job 2 of 3">
+    <div class="step done" title="Counting words — done">&#10003;</div>
+    <div class="step-link"></div>
+    <div class="step now" title="Slug maker — working on it">2</div>
+    <div class="step-link"></div>
+    <div class="step" title="Palindrome game — later">3</div>
+  </div>
+
+  <!-- The only two buttons -->
+  <div class="buttons">
+    <button class="big-btn pause">&#10074;&#10074; Pause</button>
+    <button class="big-btn stop">&#9632; Stop</button>
+  </div>
+</main>
+
+<footer>
+  Everything is safe. Nothing is broken. You can pause any time.
+</footer>
+
+</body>
+</html>

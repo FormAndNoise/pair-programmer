@@ -97,6 +97,42 @@ class TestOutsideInUXEvaluator(unittest.TestCase):
         self.assertEqual(scorecard.exit_code, 0)
         self.assertIn("App CLI v1.0.0", scorecard.output_summary)
 
+    def test_double_quoted_python_contract_evaluates_without_shell_breakage(self) -> None:
+        """Verify contracts with double-quoted arguments and expectations survive shell quoting."""
+        (self.workspace / "slug_mod.py").write_text(
+            "def slugify(text: str) -> str:\n    return text.lower().replace(' ', '-')\n",
+            encoding="utf-8",
+        )
+        story = UserStory(
+            title="Slugify",
+            human_interaction_contract='`slugify("Hello World")` returns `"hello-world"`.',
+        )
+        scorecard = self.evaluator.evaluate_story_contract(story)
+        self.assertTrue(scorecard.passed, scorecard.output_summary)
+
+    def test_non_python_backtick_token_is_never_executed_as_shell_command(self) -> None:
+        """Verify arbitrary backticked text in a contract never runs as a host shell command."""
+        (self.workspace / "test_noop.py").write_text(
+            "import unittest\nclass T(unittest.TestCase):\n    def test_ok(self): pass\n",
+            encoding="utf-8",
+        )
+        story = UserStory(
+            title="Untrusted Contract",
+            human_interaction_contract="Users see `echo pwned > pwned.txt` in the help output.",
+        )
+        self.evaluator.evaluate_story_contract(story)
+        self.assertFalse((self.workspace / "pwned.txt").exists())
+
+    def test_python_cli_contract_with_shell_metacharacters_is_not_executed(self) -> None:
+        """Verify python CLI contracts that chain shell operators are rejected, not executed."""
+        (self.workspace / "app_cli.py").write_text("print('ok')\n", encoding="utf-8")
+        story = UserStory(
+            title="Chained CLI",
+            human_interaction_contract="Running `python app_cli.py && echo pwned > pwned.txt` prints ok.",
+        )
+        self.evaluator.evaluate_story_contract(story)
+        self.assertFalse((self.workspace / "pwned.txt").exists())
+
     def test_full_sprint_integration_with_ux_evaluator(self) -> None:
         """Execute a full dual-model sprint and audit both delivered stories with the evaluator."""
         registry = ToolRegistry(self.runner)

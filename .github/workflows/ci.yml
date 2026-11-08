@@ -6,32 +6,83 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   tests:
     name: Python unit & integration tests
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
       - name: Install package (editable, with runtime deps)
         run: python -m pip install -e .
       - name: Run unittest suite
         run: PYTHONPATH=src python -m unittest discover tests
+      # Keep dependency findings visible without blocking CI while they are triaged.
+      - name: Audit Python dependencies
+        id: python_audit
+        run: |
+          python -m pip install pip-audit
+          pip-audit
+        continue-on-error: true
+      - name: File issue for Python audit findings
+        if: github.event_name == 'push' && steps.python_audit.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          issue_title="Python dependency audit findings"
+          existing=$(gh issue list --state open --limit 1000 --json title --jq 'any(.title == "Python dependency audit findings")')
+          if [ "$existing" != "true" ]; then
+            printf 'The Python dependency audit returned a non-zero exit code. Review the audit step logs.\n\nWorkflow run: %s/%s/actions/runs/%s\n' \
+              "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" > audit-issue.md
+            gh issue create --title "$issue_title" --body-file audit-issue.md
+          fi
+        continue-on-error: true
 
   frontend:
     name: Frontend build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
     defaults:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "20"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci
+      # Keep dependency findings visible without blocking CI while they are triaged.
+      - name: Audit frontend dependencies
+        id: frontend_audit
+        run: npm audit --audit-level=high
+        continue-on-error: true
+      - name: File issue for frontend audit findings
+        if: github.event_name == 'push' && steps.frontend_audit.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          issue_title="Frontend dependency audit findings"
+          existing=$(gh issue list --state open --limit 1000 --json title --jq 'any(.title == "Frontend dependency audit findings")')
+          if [ "$existing" != "true" ]; then
+            printf 'The frontend dependency audit returned a non-zero exit code. Review the audit step logs.\n\nWorkflow run: %s/%s/actions/runs/%s\n' \
+              "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" > audit-issue.md
+            gh issue create --title "$issue_title" --body-file audit-issue.md
+          fi
+        continue-on-error: true
       - run: npm run build

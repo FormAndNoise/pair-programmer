@@ -3,7 +3,7 @@
 import os
 import unittest
 from unittest import mock
-from agent_core.types import Message, Role, ToolCall, ToolDefinition
+from agent_core.types import Message, Role, ToolCall, ToolDefinition, ToolResult
 import gateway.client as gateway_module
 from gateway.client import ModelGateway
 from gateway.mock import ScriptedMockGateway
@@ -205,6 +205,79 @@ class TestDirectRouting(unittest.TestCase):
         self.assertEqual(request["headers"]["Authorization"], "Bearer sk-or-v1-test")
         self.assertEqual(request["json"]["model"], "anthropic/claude-3.5-sonnet")
 
+    def test_openai_direct_route_serializes_multi_turn_tool_results(self):
+        gateway = ModelGateway(max_retries=1)
+        fake_client = _FakeHttpClient(
+            _FakeResponse({"choices": [{"message": {"content": "done"}}]})
+        )
+        tc = ToolCall(id="call_01", name="read_file", arguments={"path": "a.py"})
+        tr = ToolResult(call_id="call_01", name="read_file", output="print(1)")
+        conversation = [
+            Message(role=Role.USER, content="Inspect a.py"),
+            Message(role=Role.ASSISTANT, content="Reading file.", tool_calls=[tc]),
+            Message(role=Role.TOOL, content=tr.output, tool_result=tr),
+        ]
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}), \
+                mock.patch.object(gateway_module.httpx, "Client", return_value=fake_client):
+            gateway._send_via_direct_api(model="openai/gpt-4o", messages=conversation)
+
+        sent_msgs = fake_client.captured_request["json"]["messages"]
+        self.assertEqual(sent_msgs[1]["tool_calls"][0]["function"]["arguments"], '{"path": "a.py"}')
+        self.assertEqual(
+            sent_msgs[2],
+            {"role": "tool", "tool_call_id": "call_01", "content": "print(1)"},
+        )
+
+    def test_anthropic_coalesces_multiple_tool_results_into_single_user_message(self):
+        gateway = ModelGateway(max_retries=1)
+        fake_client = _FakeHttpClient(_FakeResponse({"content": [{"type": "text", "text": "done"}]}))
+        tc1 = ToolCall(id="toolu_1", name="read_file", arguments={"path": "a.py"})
+        tc2 = ToolCall(id="toolu_2", name="read_file", arguments={"path": "b.py"})
+        tr1 = ToolResult(call_id="toolu_1", name="read_file", output="a")
+        tr2 = ToolResult(call_id="toolu_2", name="read_file", output="b")
+        conversation = [
+            Message(role=Role.USER, content="Read both files"),
+            Message(role=Role.ASSISTANT, content="Reading.", tool_calls=[tc1, tc2]),
+            Message(role=Role.TOOL, content="a", tool_result=tr1),
+            Message(role=Role.TOOL, content="b", tool_result=tr2),
+        ]
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "key"}), \
+                mock.patch.object(gateway_module.httpx, "Client", return_value=fake_client):
+            gateway._send_via_direct_api(model="anthropic/claude-3-5-sonnet-20241022", messages=conversation)
+
+        sent_msgs = fake_client.captured_request["json"]["messages"]
+        self.assertEqual(len(sent_msgs), 3)
+        self.assertEqual(sent_msgs[2]["role"], "user")
+        self.assertEqual(len(sent_msgs[2]["content"]), 2)
+        self.assertEqual(sent_msgs[2]["content"][0]["tool_use_id"], "toolu_1")
+        self.assertEqual(sent_msgs[2]["content"][1]["tool_use_id"], "toolu_2")
+
+    def test_gemini_coalesces_multiple_tool_results_into_single_user_content(self):
+        gateway = ModelGateway(max_retries=1)
+        fake_client = _FakeHttpClient(
+            _FakeResponse({"candidates": [{"content": {"parts": [{"text": "done"}]}}]})
+        )
+        tc1 = ToolCall(id="call_0", name="read_file", arguments={"path": "a.py"})
+        tc2 = ToolCall(id="call_1", name="list_dir", arguments={"path": "."})
+        tr1 = ToolResult(call_id="call_0", name="read_file", output="a")
+        tr2 = ToolResult(call_id="call_1", name="list_dir", output="files")
+        conversation = [
+            Message(role=Role.USER, content="Inspect workspace"),
+            Message(role=Role.ASSISTANT, content="Checking.", tool_calls=[tc1, tc2]),
+            Message(role=Role.TOOL, content="a", tool_result=tr1),
+            Message(role=Role.TOOL, content="files", tool_result=tr2),
+        ]
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "key"}), \
+                mock.patch.object(gateway_module.httpx, "Client", return_value=fake_client):
+            gateway._send_via_direct_api(model="gemini/gemini-2.5-flash", messages=conversation)
+
+        contents = fake_client.captured_request["json"]["contents"]
+        self.assertEqual(len(contents), 3)
+        self.assertEqual(contents[2]["role"], "user")
+        self.assertEqual(len(contents[2]["parts"]), 2)
+        self.assertEqual(contents[2]["parts"][0]["functionResponse"]["name"], "read_file")
+        self.assertEqual(contents[2]["parts"][1]["functionResponse"]["name"], "list_dir")
+
 
 class TestGateway(unittest.TestCase):
     def test_mock_gateway_queue_and_dispatch(self):
@@ -250,6 +323,36 @@ class TestGateway(unittest.TestCase):
         mock_gw = ScriptedMockGateway()
         res = mock_gw.send_chat(model="gpt-4o", messages=[])
         self.assertIn("[Mock Default]", res.content)
+
+
+class TestLiteLLMRoute(unittest.TestCase):
+    """Verify that LiteLLM route forwards API keys and configuration."""
+
+    def test_litellm_completion_receives_resolved_api_key_and_base_url(self):
+        fake_response = mock.MagicMock()
+        fake_choice = mock.MagicMock()
+        fake_choice.message.content = "LiteLLM response"
+        fake_choice.message.tool_calls = None
+        fake_response.choices = [fake_choice]
+
+        mock_litellm = mock.MagicMock()
+        mock_litellm.completion.return_value = fake_response
+
+        with mock.patch.object(gateway_module, "litellm", mock_litellm, create=True), \
+             mock.patch.object(gateway_module, "_LITELLM_AVAILABLE", True), \
+             mock.patch.dict(os.environ, {"OPENAI_BASE_URL": "https://custom.openai.endpoint/v1"}):
+
+            gw = ModelGateway(api_keys={"anthropic": "explicit-key-123"})
+            res = gw._send_via_litellm(
+                model="anthropic/claude-3-5-sonnet",
+                messages=[Message(role=Role.USER, content="Hello")],
+            )
+
+            self.assertEqual(res.content, "LiteLLM response")
+            mock_litellm.completion.assert_called_once()
+            called_kwargs = mock_litellm.completion.call_args.kwargs
+            self.assertEqual(called_kwargs["api_key"], "explicit-key-123")
+            self.assertEqual(called_kwargs["model"], "anthropic/claude-3-5-sonnet")
 
 
 if __name__ == "__main__":

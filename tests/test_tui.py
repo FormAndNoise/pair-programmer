@@ -85,6 +85,71 @@ class TestTUI(unittest.TestCase):
         self.assertIn("Test Epic", rendered_text)
         self.assertIn("Story 1", rendered_text)
 
+    def test_dod_badges_do_not_falsely_show_pass_before_verification(self):
+        """Verify that DoD gates display WAIT rather than fake PASS during RED and GREEN phases."""
+        self.bus.publish(AgentEvent(event_type=EventType.SPRINT_START, payload={"epic": "Test Epic"}))
+        self.bus.publish(AgentEvent(event_type=EventType.STORY_START, payload={"story_id": "US-01", "title": "Story 1"}))
+        self.bus.publish(AgentEvent(event_type=EventType.STORY_STATUS_CHANGE, payload={"status": "GREEN_IMPL"}))
+
+        self.tui.display_once()
+        rendered_text = self.console.export_text()
+        # With dod_state all False, no PASS badge should appear in DoD table
+        self.assertNotIn("PASS", rendered_text)
+
+    def test_steering_buffer_and_paused_state_rendered_in_footer(self):
+        """Verify footer displays steering input prompt when steering or paused."""
+        self.tui.is_paused = True
+        self.tui.display_once()
+        rendered_paused = self.console.export_text()
+        self.assertIn("PAUSED:", rendered_paused)
+
+        self.tui.steering_buffer = "Make timeout 5s"
+        self.tui.display_once()
+        rendered_steer = self.console.export_text()
+        self.assertIn("STEER:", rendered_steer)
+        self.assertIn("Make timeout 5s", rendered_steer)
+
+    def test_keyboard_controller_handle_key_and_posix_cbreak(self):
+        """Verify keyboard controller key actions and terminal setup."""
+        from unittest import mock
+        from tui.keyboard import TerminalKeyboardController
+
+        mock_engine = mock.MagicMock()
+        mock_engine.is_paused = False
+        ctrl = TerminalKeyboardController(engine=mock_engine, bus=self.bus, tui=self.tui)
+
+        # Normal key handling
+        self.assertEqual(ctrl.handle_key(" "), "paused")
+        mock_engine.pause.assert_called_once()
+
+        self.assertEqual(ctrl.handle_key("q"), "quit")
+        mock_engine.request_stop.assert_called_once()
+
+        # Paused typing handling
+        mock_engine.is_paused = True
+        self.assertEqual(ctrl.handle_key("H"), "typing")
+        self.assertEqual(ctrl.handle_key("i"), "typing")
+        self.assertEqual(self.tui.steering_buffer, "Hi")
+
+        self.assertEqual(ctrl.handle_key("\r"), "steered")
+        mock_engine.resume.assert_called()
+        self.assertEqual(self.tui.steering_buffer, "")
+
+        # Verify POSIX cbreak setup and cleanup without throwing
+        mock_termios = mock.MagicMock()
+        mock_tty = mock.MagicMock()
+        mock_termios.tcgetattr.return_value = [1, 2, 3]
+        mock_termios.TCSADRAIN = 1
+
+        with mock.patch.dict("sys.modules", {"termios": mock_termios, "tty": mock_tty}), \
+             mock.patch("os.name", "posix"), \
+             mock.patch("sys.stdin.isatty", return_value=True):
+
+            posix_ctrl = TerminalKeyboardController(engine=mock_engine, bus=self.bus)
+            with posix_ctrl:
+                mock_tty.setcbreak.assert_called_once()
+            mock_termios.tcsetattr.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

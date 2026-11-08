@@ -53,9 +53,22 @@ const statusLabels: Record<string, string> = {
   red_tests: "Writing tests",
   green_impl: "Implementation",
   review: "Review",
+  refactor: "Refactoring",
+  stopped: "Stopped",
   done: "Done",
   blocked: "Blocked",
 };
+
+const tokenStorageKey = "pairProgrammerToken";
+
+function getSessionToken() {
+  const existing = window.sessionStorage.getItem(tokenStorageKey);
+  if (existing !== null) return existing;
+  const entered = window.prompt("Enter the Pair Programmer access token:");
+  const token = entered?.trim() ?? "";
+  window.sessionStorage.setItem(tokenStorageKey, token);
+  return token;
+}
 
 function prettyModel(model?: string | null) {
   if (!model) return "System";
@@ -114,6 +127,7 @@ function eventTone(type: string) {
 }
 
 function App() {
+  const [authToken, setAuthToken] = useState(getSessionToken);
   const [session, setSession] = useState<Session | null>(null);
   const [events, setEvents] = useState<AgentEvent[]>([]);
   const [connection, setConnection] = useState<"connecting" | "live" | "offline">("connecting");
@@ -121,13 +135,20 @@ function App() {
   const [draft, setDraft] = useState<StoryDraft>(initialDraft);
   const [steering, setSteering] = useState("");
   const [busy, setBusy] = useState(false);
-  const [notice, setNotice] = useState("");
+  const [notice, setNotice] = useState(authToken ? "" : "An access token is required. Enter it with the workspace button.");
   const [filter, setFilter] = useState("all");
   const formInitialized = useRef(false);
 
   const loadStatus = useCallback(async () => {
     try {
-      const response = await fetch("/api/status");
+      const response = await fetch("/api/status", {
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+      if (response.status === 401) {
+        setNotice("The access token was rejected. Use the workspace button to update it.");
+        setConnection("offline");
+        return;
+      }
       if (!response.ok) throw new Error("The studio API is unavailable.");
       const data = (await response.json()) as Session;
       setSession(data);
@@ -146,11 +167,13 @@ function App() {
     } catch {
       setConnection("offline");
     }
-  }, []);
+  }, [authToken]);
 
   const loadRecentEvents = useCallback(async () => {
     try {
-      const response = await fetch("/api/events?limit=300");
+      const response = await fetch("/api/events?limit=300", {
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
       if (!response.ok) return;
       const data = (await response.json()) as { events: AgentEvent[] };
       setEvents((current) => {
@@ -161,7 +184,7 @@ function App() {
     } catch {
       // The WebSocket remains the source for new events when history is unavailable.
     }
-  }, []);
+  }, [authToken]);
 
   useEffect(() => {
     void loadStatus();
@@ -173,7 +196,10 @@ function App() {
     const connect = () => {
       if (closed) return;
       setConnection((current) => current === "live" ? current : "connecting");
-      socket = new WebSocket(`${protocol}//${window.location.host}/ws/events`);
+      socket = new WebSocket(`${protocol}//${window.location.host}/ws/events`, [
+        "pair-programmer",
+        `bearer.${authToken}`,
+      ]);
       socket.onopen = () => {
         setConnection("live");
         void loadRecentEvents();
@@ -200,7 +226,7 @@ function App() {
       window.clearInterval(poll);
       socket?.close();
     };
-  }, [loadRecentEvents, loadStatus]);
+  }, [authToken, loadRecentEvents, loadStatus]);
 
   const runAction = async (path: string, body?: unknown) => {
     setBusy(true);
@@ -208,10 +234,16 @@ function App() {
     try {
       const response = await fetch(path, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          Authorization: `Bearer ${authToken}`,
+          "Content-Type": "application/json",
+        },
         body: body ? JSON.stringify(body) : undefined,
       });
       const data = await response.json().catch(() => ({}));
+      if (response.status === 401) {
+        throw new Error("The access token was rejected. Use the workspace button to update it.");
+      }
       if (!response.ok) throw new Error(String(data.detail ?? "The request could not be completed."));
       await loadStatus();
       return true;
@@ -221,6 +253,14 @@ function App() {
     } finally {
       setBusy(false);
     }
+  };
+
+  const updateAuthToken = () => {
+    const entered = window.prompt("Enter the Pair Programmer access token:");
+    const token = entered?.trim();
+    if (!token) return;
+    window.sessionStorage.setItem(tokenStorageKey, token);
+    setAuthToken(token);
   };
 
   const startSprint = async (event: FormEvent) => {
@@ -267,7 +307,7 @@ function App() {
         <div className="topbar-right">
           <span className={`connection ${connection}`}><i />{connection === "live" ? "Live connection" : connection === "offline" ? "Reconnecting" : "Connecting"}</span>
           <span className="topbar-separator" />
-          <button className="avatar-button" aria-label="Workspace">AW</button>
+          <button className="avatar-button" aria-label="Update access token" title="Update access token" onClick={updateAuthToken}>AW</button>
         </div>
       </header>
 
@@ -279,9 +319,14 @@ function App() {
             <p className="page-subtitle">A focused workspace for your AI pair to plan, code, and review.</p>
           </div>
           <div className="heading-actions">
-            {isActive && <button className="control-button" onClick={() => void runAction(canPause ? "/api/sprint/pause" : "/api/sprint/resume")} disabled={busy}>
-              <span>{canPause ? "Ⅱ" : "▶"}</span>{canPause ? "Pause sprint" : "Resume sprint"}
-            </button>}
+            {isActive && <>
+              <button className="control-button" onClick={() => void runAction(canPause ? "/api/sprint/pause" : "/api/sprint/resume")} disabled={busy}>
+                <span>{canPause ? "Ⅱ" : "▶"}</span>{canPause ? "Pause sprint" : "Resume sprint"}
+              </button>
+              <button className="control-button" onClick={() => void runAction("/api/sprint/stop")} disabled={busy} style={{ borderColor: "#ef4444", color: "#f87171" }}>
+                <span>■</span>Stop sprint
+              </button>
+            </>}
             <div className={`session-pill ${activeStatus}`}><span className="session-pulse" />{statusLabels[activeStatus] ?? activeStatus}</div>
           </div>
         </section>
@@ -320,13 +365,13 @@ function App() {
                 <span className="pair-symbol">A <span>↔</span> B</span>
               </div>
               <div className="model-row">
-                <div className="model-chip"><span className="model-avatar model-a">A</span><div><span className="micro-label">MODEL A</span><strong>{prettyModel(session?.models?.a) || "Anthropic Claude"}</strong></div><span className="role-label">Test author</span></div>
+                <div className="model-chip"><span className="model-avatar model-a">A</span><div><span className="micro-label">MODEL A</span><strong>{prettyModel(session?.models?.a) || "Anthropic Claude"}</strong></div><span className="role-label">{((session?.current_index ?? 0) % 2 === 1) ? "Implementer" : "Test author"}</span></div>
                 <span className="model-connector">↔</span>
-                <div className="model-chip"><span className="model-avatar model-b">B</span><div><span className="micro-label">MODEL B</span><strong>{prettyModel(session?.models?.b) || "Google Gemini"}</strong></div><span className="role-label">Implementer</span></div>
+                <div className="model-chip"><span className="model-avatar model-b">B</span><div><span className="micro-label">MODEL B</span><strong>{prettyModel(session?.models?.b) || "Google Gemini"}</strong></div><span className="role-label">{((session?.current_index ?? 0) % 2 === 1) ? "Test author" : "Implementer"}</span></div>
               </div>
             </div>
 
-            {(!isActive && activeStatus !== "complete") && <form className="start-card" onSubmit={startSprint}>
+            {!isActive && <form className="start-card" onSubmit={startSprint}>
               <div className="card-heading start-heading"><div><span className="section-kicker">START A SPRINT</span><h2>What are we building?</h2></div><span className="start-spark">✦</span></div>
               <label className="field-label" htmlFor="epic">Sprint goal</label>
               <input id="epic" className="text-input" value={epic} onChange={(e) => setEpic(e.target.value)} maxLength={500} required placeholder="e.g. Build a markdown converter" />

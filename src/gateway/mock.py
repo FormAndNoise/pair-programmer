@@ -9,9 +9,10 @@ from agent_core.types import Message, Role, ToolCall, ToolDefinition
 class ScriptedMockGateway:
     """Mock gateway that returns scripted responses for offline and unit tests."""
 
-    def __init__(self) -> None:
+    def __init__(self, multi_turn: bool = False) -> None:
         self._queues: Dict[str, List[Message]] = {}
         self.call_history: List[Dict[str, Any]] = []
+        self.single_shot_tools: bool = not multi_turn
 
     def queue_response(self, model: str, response: Message) -> None:
         """Queue a predetermined response for a specific model."""

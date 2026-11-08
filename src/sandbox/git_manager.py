@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -30,7 +31,16 @@ DEFAULT_EXCLUDES: Tuple[str, ...] = (
     "*.py[cod]",
     ".pytest_cache/",
     ".coverage",
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "id_rsa*",
+    "*.p12",
+    "*.pfx",
 )
+
+_BASE_BRANCH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 
 HARNESS_NAME = "Pair Programmer Harness"
 HARNESS_EMAIL = "harness@pair-programmer.local"
@@ -89,6 +99,13 @@ class GitManager:
         git_binary: str = "git",
     ) -> None:
         self.workspace_dir = Path(workspace_dir).resolve()
+        if (
+            not isinstance(base_branch, str)
+            or not _BASE_BRANCH_PATTERN.fullmatch(base_branch)
+            or base_branch.startswith("-")
+            or ".." in base_branch
+        ):
+            raise ValueError("base_branch must be a safe branch name without leading '-' or '..'.")
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
         default_git_dir = self.workspace_dir.parent / ".pair_programmer_git" / f"{self.workspace_dir.name}.git"
         self.git_dir = Path(git_dir).resolve() if git_dir else default_git_dir
@@ -197,6 +214,7 @@ class GitManager:
 
     def ensure_repository(self) -> None:
         """Initialize the external git dir and the base branch if they are missing."""
+        self._write_workspace_gitignore()
         if not (self.git_dir / "HEAD").exists():
             self.git_dir.parent.mkdir(parents=True, exist_ok=True)
             self._run_raw(["init", "--bare", "--quiet", str(self.git_dir)])
@@ -326,6 +344,35 @@ class GitManager:
         info = self.git_dir / "info"
         info.mkdir(parents=True, exist_ok=True)
         (info / "exclude").write_text("\n".join(DEFAULT_EXCLUDES) + "\n", encoding="utf-8")
+
+    def _write_workspace_gitignore(self) -> None:
+        """Add harness exclusions to the workspace ignore file without replacing it."""
+        ignore_path = self.workspace_dir / ".gitignore"
+        if ignore_path.is_symlink():
+            ignore_path.unlink()
+        existing = ignore_path.read_text(encoding="utf-8") if ignore_path.exists() else ""
+        block = ["# Pair Programmer harness exclusions", *DEFAULT_EXCLUDES]
+        if existing.splitlines()[-len(block):] == block:
+            return
+        prefix = existing
+        if prefix and not prefix.endswith(("\n", "\r")):
+            prefix += "\n"
+        if prefix and not prefix.endswith("\n\n"):
+            prefix += "\n"
+        content = prefix + "\n".join(block) + "\n"
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=self.workspace_dir,
+            prefix=".pair-programmer-gitignore-",
+            delete=False,
+        ) as temporary:
+            temporary.write(content)
+            temporary_path = Path(temporary.name)
+        try:
+            os.replace(temporary_path, ignore_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
 
     def _branch_exists(self, branch: str) -> bool:
         return self._git_ok("show-ref", "--verify", "--quiet", f"refs/heads/{branch}")

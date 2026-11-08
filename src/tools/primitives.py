@@ -4,10 +4,20 @@ from __future__ import annotations
 
 import difflib
 import os
+import tempfile
+import uuid
 from pathlib import Path
 from typing import Optional
 from agent_core.types import ToolResult
 from sandbox.runner import SandboxRunner
+
+MAX_WRITE_BYTES = 1_000_000  # 1 MB content limit
+MAX_READ_BYTES = 2_000_000   # 2 MB content limit
+
+
+def _resolve_call_id(call_id: Optional[str]) -> str:
+    cleaned = (call_id or "").strip()
+    return cleaned if cleaned else f"call_{uuid.uuid4().hex}"
 
 
 def read_file(
@@ -15,22 +25,40 @@ def read_file(
     path: str,
     offset: int = 1,
     limit: Optional[int] = 500,
+    call_id: Optional[str] = None,
 ) -> ToolResult:
     """Read file content with line numbers and optional line-range limits."""
+    cid = _resolve_call_id(call_id)
     try:
+        if offset < 0 or (limit is not None and limit < 0):
+            return ToolResult(
+                call_id=cid,
+                name="read_file",
+                output="Error: offset and limit must be zero or greater.",
+                is_error=True,
+            )
         resolved = runner.resolve_path(path)
         if not resolved.exists():
             return ToolResult(
-                call_id="",
+                call_id=cid,
                 name="read_file",
                 output=f"Error: File '{path}' does not exist.",
                 is_error=True,
             )
         if resolved.is_dir():
             return ToolResult(
-                call_id="",
+                call_id=cid,
                 name="read_file",
                 output=f"Error: '{path}' is a directory, not a file. Use list_dir instead.",
+                is_error=True,
+            )
+
+        file_size = resolved.stat().st_size
+        if file_size > MAX_READ_BYTES:
+            return ToolResult(
+                call_id=cid,
+                name="read_file",
+                output=f"Error: File '{path}' size ({file_size} bytes) exceeds limit of {MAX_READ_BYTES} bytes.",
                 is_error=True,
             )
 
@@ -39,7 +67,7 @@ def read_file(
 
         total_lines = len(lines)
         start_idx = max(0, offset - 1)
-        end_idx = min(total_lines, start_idx + limit) if limit else total_lines
+        end_idx = total_lines if limit is None else min(total_lines, start_idx + limit)
 
         selected_lines = lines[start_idx:end_idx]
         formatted_content = "".join(
@@ -48,17 +76,17 @@ def read_file(
 
         header = f"=== File: {path} (Showing lines {start_idx + 1}-{end_idx} of {total_lines}) ===\n"
         return ToolResult(
-            call_id="",
+            call_id=cid,
             name="read_file",
             output=header + formatted_content,
             is_error=False,
         )
 
     except PermissionError as e:
-        return ToolResult(call_id="", name="read_file", output=str(e), is_error=True)
+        return ToolResult(call_id=cid, name="read_file", output=str(e), is_error=True)
     except Exception as e:
         return ToolResult(
-            call_id="",
+            call_id=cid,
             name="read_file",
             output=f"Unexpected read failure: {e}",
             is_error=True,
@@ -70,34 +98,62 @@ def write_file(
     path: str,
     content: str,
     overwrite: bool = True,
+    call_id: Optional[str] = None,
 ) -> ToolResult:
-    """Write or overwrite file contents in the sandbox."""
+    """Write or overwrite file contents in the sandbox atomically."""
+    cid = _resolve_call_id(call_id)
     try:
+        content_bytes = content.encode("utf-8")
+        if len(content_bytes) > MAX_WRITE_BYTES:
+            return ToolResult(
+                call_id=cid,
+                name="write_file",
+                output=f"Error: Content length ({len(content_bytes)} bytes) exceeds maximum limit of {MAX_WRITE_BYTES} bytes.",
+                is_error=True,
+            )
+
         resolved = runner.resolve_path(path)
         if resolved.exists() and not overwrite:
             return ToolResult(
-                call_id="",
+                call_id=cid,
                 name="write_file",
                 output=f"Error: File '{path}' already exists and overwrite is set to False.",
                 is_error=True,
             )
 
         resolved.parent.mkdir(parents=True, exist_ok=True)
-        with open(resolved, "w", encoding="utf-8") as f:
-            f.write(content)
+        tmp_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=resolved.parent,
+                mode="w",
+                encoding="utf-8",
+                delete=False,
+                prefix=".tmp_write_",
+            ) as f:
+                tmp_path = Path(f.name)
+                f.write(content)
+            os.replace(tmp_path, resolved)
+            tmp_path = None
+        finally:
+            if tmp_path is not None and tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
 
         return ToolResult(
-            call_id="",
+            call_id=cid,
             name="write_file",
             output=f"Successfully written {len(content)} characters to '{path}'.",
             is_error=False,
         )
 
     except PermissionError as e:
-        return ToolResult(call_id="", name="write_file", output=str(e), is_error=True)
+        return ToolResult(call_id=cid, name="write_file", output=str(e), is_error=True)
     except Exception as e:
         return ToolResult(
-            call_id="",
+            call_id=cid,
             name="write_file",
             output=f"Failed to write file '{path}': {e}",
             is_error=True,
@@ -109,25 +165,60 @@ def patch_file(
     path: str,
     target_snippet: str,
     replacement_snippet: str,
+    call_id: Optional[str] = None,
 ) -> ToolResult:
     """Safely replace a target code snippet with replacement code and return a diff."""
+    cid = _resolve_call_id(call_id)
     try:
+        repl_bytes = replacement_snippet.encode("utf-8")
+        if len(repl_bytes) > MAX_WRITE_BYTES:
+            return ToolResult(
+                call_id=cid,
+                name="patch_file",
+                output=f"Error: Replacement snippet ({len(repl_bytes)} bytes) exceeds maximum limit of {MAX_WRITE_BYTES} bytes.",
+                is_error=True,
+            )
+
+        if "\x00" in target_snippet or "\x00" in replacement_snippet:
+            return ToolResult(
+                call_id=cid,
+                name="patch_file",
+                output="Error: patch_file only supports text; binary content detected in snippets.",
+                is_error=True,
+            )
+
         resolved = runner.resolve_path(path)
         if not resolved.exists():
             return ToolResult(
-                call_id="",
+                call_id=cid,
                 name="patch_file",
                 output=f"Error: Target file '{path}' does not exist.",
                 is_error=True,
             )
 
-        with open(resolved, "r", encoding="utf-8") as f:
+        if resolved.stat().st_size > MAX_READ_BYTES:
+            return ToolResult(
+                call_id=cid,
+                name="patch_file",
+                output=f"Error: Target file '{path}' exceeds maximum size of {MAX_READ_BYTES} bytes.",
+                is_error=True,
+            )
+
+        with open(resolved, "r", encoding="utf-8", errors="replace") as f:
             original = f.read()
+
+        if "\x00" in original:
+            return ToolResult(
+                call_id=cid,
+                name="patch_file",
+                output=f"Error: Cannot patch binary file '{path}'.",
+                is_error=True,
+            )
 
         match_count = original.count(target_snippet)
         if match_count == 0:
             return ToolResult(
-                call_id="",
+                call_id=cid,
                 name="patch_file",
                 output=(
                     f"Error: Target snippet not found in '{path}'. "
@@ -137,7 +228,7 @@ def patch_file(
             )
         if match_count > 1:
             return ToolResult(
-                call_id="",
+                call_id=cid,
                 name="patch_file",
                 output=(
                     f"Error: Target snippet found {match_count} times in '{path}'. "
@@ -147,8 +238,27 @@ def patch_file(
             )
 
         updated = original.replace(target_snippet, replacement_snippet, 1)
-        with open(resolved, "w", encoding="utf-8") as f:
-            f.write(updated)
+
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=resolved.parent,
+                mode="w",
+                encoding="utf-8",
+                delete=False,
+                prefix=".tmp_patch_",
+            ) as f:
+                tmp_path = Path(f.name)
+                f.write(updated)
+            os.replace(tmp_path, resolved)
+            tmp_path = None
+        finally:
+            if tmp_path is not None and tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
 
         # Generate readable diff
         diff = list(
@@ -162,17 +272,17 @@ def patch_file(
         diff_text = "".join(diff) or "[No visible line changes]"
 
         return ToolResult(
-            call_id="",
+            call_id=cid,
             name="patch_file",
             output=f"Successfully patched '{path}'.\n\nUnified Diff:\n{diff_text}",
             is_error=False,
         )
 
     except PermissionError as e:
-        return ToolResult(call_id="", name="patch_file", output=str(e), is_error=True)
+        return ToolResult(call_id=cid, name="patch_file", output=str(e), is_error=True)
     except Exception as e:
         return ToolResult(
-            call_id="",
+            call_id=cid,
             name="patch_file",
             output=f"Failed to patch file '{path}': {e}",
             is_error=True,
@@ -184,20 +294,22 @@ def list_dir(
     path: str = ".",
     recursive: bool = False,
     max_depth: int = 2,
+    call_id: Optional[str] = None,
 ) -> ToolResult:
     """List files and subdirectories within a sandbox folder."""
+    cid = _resolve_call_id(call_id)
     try:
         resolved = runner.resolve_path(path)
         if not resolved.exists():
             return ToolResult(
-                call_id="",
+                call_id=cid,
                 name="list_dir",
                 output=f"Error: Directory '{path}' does not exist.",
                 is_error=True,
             )
         if not resolved.is_dir():
             return ToolResult(
-                call_id="",
+                call_id=cid,
                 name="list_dir",
                 output=f"Error: '{path}' is a file, not a directory.",
                 is_error=True,
@@ -226,13 +338,13 @@ def list_dir(
                     entries.append(f"[FILE] {p.stat().st_size:8d} B  {rel}")
 
         output = f"=== Directory: {path} ({len(entries)} items) ===\n" + "\n".join(entries)
-        return ToolResult(call_id="", name="list_dir", output=output, is_error=False)
+        return ToolResult(call_id=cid, name="list_dir", output=output, is_error=False)
 
     except PermissionError as e:
-        return ToolResult(call_id="", name="list_dir", output=str(e), is_error=True)
+        return ToolResult(call_id=cid, name="list_dir", output=str(e), is_error=True)
     except Exception as e:
         return ToolResult(
-            call_id="",
+            call_id=cid,
             name="list_dir",
             output=f"Failed to list directory '{path}': {e}",
             is_error=True,
@@ -243,14 +355,29 @@ def run_command(
     runner: SandboxRunner,
     command: str,
     timeout_seconds: Optional[int] = None,
+    call_id: Optional[str] = None,
 ) -> ToolResult:
     """Run a terminal command inside the sandbox."""
-    exec_res = runner.run_command(command, timeout_seconds=timeout_seconds)
-    formatted = exec_res.format_output()
-    return ToolResult(
-        call_id="",
-        name="run_command",
-        output=formatted,
-        is_error=not exec_res.is_success,
-        execution_time_ms=exec_res.duration_ms,
-    )
+    cid = _resolve_call_id(call_id)
+    try:
+        effective_timeout = (
+            timeout_seconds
+            if (timeout_seconds is not None and timeout_seconds > 0)
+            else getattr(runner, "timeout_seconds", 60)
+        )
+        exec_res = runner.run_command(command, timeout_seconds=effective_timeout)
+        formatted = exec_res.format_output()
+        return ToolResult(
+            call_id=cid,
+            name="run_command",
+            output=formatted,
+            is_error=not exec_res.is_success,
+            execution_time_ms=exec_res.duration_ms,
+        )
+    except Exception as e:
+        return ToolResult(
+            call_id=cid,
+            name="run_command",
+            output=f"Command execution error: {e}",
+            is_error=True,
+        )

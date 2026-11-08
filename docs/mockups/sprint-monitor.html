@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pair Programmer Studio — Sprint Monitor Mockup</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0F172A;
+    --surface: #1E293B;
+    --surface-muted: #272F42;
+    --border: #475569;
+    --fg: #F8FAFC;
+    --fg-muted: #94A3B8;
+    --accent: #22C55E;
+    --info: #38BDF8;
+    --warning: #FACC15;
+    --destructive: #EF4444;
+    --review: #C084FC;
+    --model-b: #FBBF24;
+    --radius: 8px;
+    --radius-badge: 4px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: 'Inter', sans-serif;
+    font-size: 13px;
+    line-height: 1.4;
+    width: 1440px;
+    height: 900px;
+    overflow: hidden;
+  }
+  .mono { font-family: 'JetBrains Mono', monospace; }
+
+  /* ---------- App shell ---------- */
+  .app { display: flex; flex-direction: column; height: 100%; }
+
+  /* ---------- Header ---------- */
+  .header {
+    display: flex; align-items: center; gap: 12px;
+    height: 48px; padding: 0 16px;
+    background: var(--surface); border-bottom: 1px solid var(--border);
+  }
+  .conn-badge {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 11px; font-weight: 600; color: var(--accent);
+    text-transform: uppercase; letter-spacing: 0.04em;
+  }
+  .conn-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
+  .brand { font-size: 13px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+  .epic-chip {
+    display: flex; align-items: center; gap: 6px;
+    padding: 4px 10px; background: var(--bg); border: 1px solid var(--border);
+    border-radius: var(--radius-badge); font-size: 12px;
+  }
+  .epic-chip .label { color: var(--fg-muted); font-weight: 500; }
+  .epic-chip .value { color: var(--info); font-weight: 600; }
+  .header-spacer { flex: 1; }
+  .model-pair { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--fg-muted); }
+  .model-tag { font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 600; }
+  .model-tag.a { color: var(--info); }
+  .model-tag.b { color: var(--model-b); }
+  .ctrl-btn {
+    padding: 6px 14px; border-radius: var(--radius-badge);
+    font: 600 12px 'Inter', sans-serif; border: 1px solid var(--border);
+    background: var(--surface-muted); color: var(--fg); cursor: pointer;
+  }
+  .ctrl-btn:hover { border-color: var(--info); }
+  .ctrl-btn.pause { border-color: var(--warning); color: var(--warning); }
+  .ctrl-btn.stop  { border-color: var(--destructive); color: var(--destructive); }
+  .ctrl-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* ---------- Main grid ---------- */
+  .main {
+    flex: 1; display: grid;
+    grid-template-columns: 260px 1fr 320px;
+    gap: 8px; padding: 8px; min-height: 0;
+  }
+  .panel {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+  .panel-title {
+    padding: 10px 12px 8px; font-size: 12px; font-weight: 700;
+    letter-spacing: 0.06em; text-transform: uppercase; color: var(--info);
+    border-bottom: 1px solid var(--border);
+  }
+
+  /* ---------- Backlog ---------- */
+  .story-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 12px; border-bottom: 1px solid var(--surface-muted);
+  }
+  .story-row:last-child { border-bottom: none; }
+  .badge {
+    flex-shrink: 0; padding: 2px 6px; border-radius: var(--radius-badge);
+    font-size: 10px; font-weight: 700; letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+  .badge.done   { background: var(--accent); color: #000; }
+  .badge.active { background: var(--warning); color: #000; }
+  .badge.todo   { background: transparent; color: var(--info); border: 1px solid var(--info); }
+  .story-name { font-weight: 500; }
+
+  /* ---------- DoD gate ---------- */
+  .dod-panel { border-top: 1px solid var(--border); }
+  .dod-title { color: var(--warning); }
+  .dod-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 9px 12px; border-bottom: 1px solid var(--surface-muted);
+  }
+  .dod-row:last-child { border-bottom: none; }
+  .dod-label { font-weight: 500; }
+  .dod-status { font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: var(--radius-badge); }
+  .dod-status.pass   { background: var(--accent); color: #000; }
+  .dod-status.review { background: var(--warning); color: #000; }
+  .dod-status.wait   { background: var(--surface-muted); color: var(--fg-muted); }
+
+  /* ---------- Stage ---------- */
+  .stage { display: flex; flex-direction: column; }
+  .stage-head {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 12px; border-bottom: 1px solid var(--border);
+  }
+  .phase-badge {
+    padding: 3px 10px; border-radius: var(--radius-badge);
+    font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;
+    background: var(--accent); color: #000;
+  }
+  .stage-sub { color: var(--fg-muted); font-size: 12px; }
+  .stage-body { flex: 1; padding: 8px 12px; overflow: hidden; display: flex; flex-direction: column; gap: 8px; }
+
+  .seat {
+    border: 1px solid var(--border); border-left-width: 3px;
+    border-radius: var(--radius); padding: 8px 12px;
+    background: var(--bg);
+  }
+  .seat.driver    { border-left-color: var(--info); }
+  .seat.navigator { border-left-color: var(--model-b); }
+  .seat.review    { border-left-color: var(--review); }
+  .seat-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+  .seat-time { font-size: 11px; color: var(--fg-muted); }
+  .seat-role { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; }
+  .seat.driver .seat-role    { color: var(--info); }
+  .seat.navigator .seat-role { color: var(--model-b); }
+  .seat.review .seat-role    { color: var(--review); }
+  .seat-model { font-size: 11px; font-weight: 600; color: var(--fg-muted); }
+  .seat-msg { color: var(--fg); }
+  .tool-chip {
+    display: inline-flex; align-items: center; gap: 5px; margin-top: 6px;
+    padding: 2px 8px; border-radius: var(--radius-badge);
+    background: var(--surface-muted); font-family: 'JetBrains Mono', monospace;
+    font-size: 11px; color: var(--info);
+  }
+  .code-block {
+    margin-top: 6px; padding: 8px 10px; border-radius: var(--radius-badge);
+    background: #0B1220; border: 1px solid var(--surface-muted);
+    font-family: 'JetBrains Mono', monospace; font-size: 11.5px; line-height: 1.55;
+    color: #A5D6FF; white-space: pre;
+  }
+
+  .vm-log {
+    border-top: 1px solid var(--border); padding: 8px 12px;
+    font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--fg-muted);
+    display: flex; flex-direction: column; gap: 3px;
+  }
+  .vm-log .tool { color: var(--info); }
+  .vm-log .git  { color: var(--accent); }
+  .vm-log .op   { color: var(--warning); }
+
+  /* ---------- Event feed ---------- */
+  .feed-filters { display: flex; gap: 6px; padding: 8px 12px; border-bottom: 1px solid var(--border); }
+  .pill {
+    padding: 3px 10px; border-radius: 999px; font-size: 11px; font-weight: 600;
+    background: var(--surface-muted); color: var(--fg-muted); border: 1px solid transparent;
+    cursor: pointer;
+  }
+  .pill.on { background: var(--info); color: #000; }
+  .event-row {
+    display: flex; gap: 8px; padding: 8px 12px;
+    border-bottom: 1px solid var(--surface-muted); align-items: flex-start;
+  }
+  .tone-dot { flex-shrink: 0; width: 8px; height: 8px; border-radius: 50%; margin-top: 4px; }
+  .tone-dot.system  { background: var(--fg-muted); }
+  .tone-dot.model   { background: var(--info); }
+  .tone-dot.tool    { background: var(--review); }
+  .tone-dot.success { background: var(--accent); }
+  .tone-dot.danger  { background: var(--destructive); }
+  .event-meta { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+  .event-top { display: flex; gap: 8px; align-items: baseline; }
+  .event-time { font-size: 10px; color: var(--fg-muted); }
+  .event-title { font-size: 12px; font-weight: 600; }
+  .event-detail { font-size: 11px; color: var(--fg-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* ---------- Steer bar ---------- */
+  .steer-bar {
+    display: flex; align-items: center; gap: 10px;
+    height: 44px; padding: 0 16px;
+    background: var(--surface); border-top: 1px solid var(--border);
+  }
+  .steer-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--warning); }
+  .steer-input {
+    flex: 1; height: 30px; padding: 0 12px;
+    background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-badge);
+    color: var(--fg); font: 12px 'Inter', sans-serif; outline: none;
+  }
+  .steer-input:focus { border-color: var(--info); box-shadow: 0 0 0 2px rgba(56,189,248,0.35); }
+  .steer-count { font-size: 10px; color: var(--fg-muted); }
+  .steer-send {
+    padding: 6px 16px; border-radius: var(--radius-badge); border: none;
+    background: var(--accent); color: #000; font: 700 12px 'Inter', sans-serif; cursor: pointer;
+  }
+  .key-hints { display: flex; gap: 12px; font-size: 10px; color: var(--fg-muted); }
+  .key-hints kbd {
+    padding: 1px 5px; border: 1px solid var(--border); border-radius: 3px;
+    background: var(--bg); font-family: 'JetBrains Mono', monospace; font-size: 10px;
+  }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- HEADER -->
+  <header class="header">
+    <span class="conn-badge"><span class="conn-dot"></span>Live</span>
+    <span class="brand">Pair Programmer Studio</span>
+    <span class="epic-chip"><span class="label">Epic</span><span class="value">Build Text Processing Suite</span></span>
+    <span class="header-spacer"></span>
+    <span class="model-pair">
+      <span class="model-tag a">anthropic/claude-3-5-sonnet</span>
+      <span>&#8596;</span>
+      <span class="model-tag b">gemini/gemini-2-5-flash</span>
+    </span>
+    <button class="ctrl-btn pause">Pause</button>
+    <button class="ctrl-btn" disabled>Resume</button>
+    <button class="ctrl-btn stop">Stop</button>
+  </header>
+
+  <!-- MAIN -->
+  <main class="main">
+
+    <!-- LEFT: backlog + DoD -->
+    <section class="panel">
+      <div class="panel-title">Sprint Backlog</div>
+      <div class="story-row"><span class="badge done">Done</span><span class="story-name">Word Frequency Counter</span></div>
+      <div class="story-row"><span class="badge active">Active</span><span class="story-name">Slug Generator</span></div>
+      <div class="story-row"><span class="badge todo">Todo</span><span class="story-name">Palindrome Checker</span></div>
+
+      <div class="dod-panel" style="margin-top:auto;">
+        <div class="panel-title dod-title">Quality Gate (DoD)</div>
+        <div class="dod-row"><span class="dod-label">Syntax &amp; Linter</span><span class="dod-status pass">Pass</span></div>
+        <div class="dod-row"><span class="dod-label">Sandbox Tests</span><span class="dod-status pass">Pass</span></div>
+        <div class="dod-row"><span class="dod-label">Cross-Model LGTM</span><span class="dod-status review">Review</span></div>
+        <div class="dod-row"><span class="dod-label">Outside-In UX</span><span class="dod-status wait">Wait</span></div>
+      </div>
+    </section>
+
+    <!-- CENTER: stage -->
+    <section class="panel stage">
+      <div class="stage-head">
+        <span class="panel-title" style="border:none;padding:0;">Collaboration Stage</span>
+        <span class="phase-badge">Green &middot; Implementing</span>
+        <span class="stage-sub">Story 2 of 3 &middot; refactor attempt 1/3</span>
+      </div>
+      <div class="stage-body">
+        <div class="seat driver">
+          <div class="seat-head">
+            <span class="seat-time mono">10:22:41</span>
+            <span class="seat-role">Driver &middot; Test Author</span>
+            <span class="seat-model mono">gemini/gemini-2-5-flash</span>
+          </div>
+          <div class="seat-msg">Writing the failing test for slugification first. Expect <span class="mono">slugify('Hello World!')</span> to return <span class="mono">'hello-world'</span>.</div>
+          <div class="tool-chip">&#9881; write_file &middot; test_slug.py</div>
+          <div class="code-block">class TestSlug(unittest.TestCase):
+    def test_slugify(self):
+        self.assertEqual(slugify('Hello World!'), 'hello-world')</div>
+        </div>
+
+        <div class="seat navigator">
+          <div class="seat-head">
+            <span class="seat-time mono">10:23:07</span>
+            <span class="seat-role">Navigator &middot; Implementer</span>
+            <span class="seat-model mono">anthropic/claude-3-5-sonnet</span>
+          </div>
+          <div class="seat-msg">Implementing regex-based slugification. Strips punctuation, lowercases, collapses whitespace to hyphens.</div>
+          <div class="tool-chip">&#9881; write_file &middot; slug_util.py</div>
+        </div>
+
+        <div class="seat review">
+          <div class="seat-head">
+            <span class="seat-time mono">10:23:19</span>
+            <span class="seat-role">Review</span>
+            <span class="seat-model mono">gemini/gemini-2-5-flash</span>
+          </div>
+          <div class="seat-msg">Regex handles punctuation and whitespace cleanly. LGTM.</div>
+        </div>
+      </div>
+
+      <div class="vm-log">
+        <span><span class="tool">[write_file]</span> test_slug.py written (312 bytes)</span>
+        <span><span class="tool">[run_command]</span> python -m unittest — 2 passed</span>
+        <span><span class="git">[git]</span> a1b2c3d feat: slug generator (claude)</span>
+        <span><span class="op">[steer]</span> Guidance queued: "prefer stdlib only"</span>
+      </div>
+    </section>
+
+    <!-- RIGHT: event feed -->
+    <aside class="panel">
+      <div class="panel-title">Event Feed</div>
+      <div class="feed-filters">
+        <span class="pill on">All</span><span class="pill">Models</span><span class="pill">Tools</span><span class="pill">Errors</span>
+      </div>
+      <div class="event-row"><span class="tone-dot success"></span><div class="event-meta"><div class="event-top"><span class="event-time mono">10:23:31</span><span class="event-title">Quality checks passed</span></div><span class="event-detail">&#10003; syntax &middot; &#10003; tests &middot; &#10003; LGTM &middot; &#9675; UX</span></div></div>
+      <div class="event-row"><span class="tone-dot model"></span><div class="event-meta"><div class="event-top"><span class="event-time mono">10:23:19</span><span class="event-title">Review received</span></div><span class="event-detail">Regex handles punctuation cleanly. LGTM.</span></div></div>
+      <div class="event-row"><span class="tone-dot tool"></span><div class="event-meta"><div class="event-top"><span class="event-time mono">10:23:07</span><span class="event-title">write_file finished</span></div><span class="event-detail">slug_util.py written to sandbox workspace.</span></div></div>
+      <div class="event-row"><span class="tone-dot model"></span><div class="event-meta"><div class="event-top"><span class="event-time mono">10:22:41</span><span class="event-title">Pair update</span></div><span class="event-detail">Writing the failing test for slugification…</span></div></div>
+      <div class="event-row"><span class="tone-dot success"></span><div class="event-meta"><div class="event-top"><span class="event-time mono">10:21:55</span><span class="event-title">Completed: Word Frequency Counter</span></div><span class="event-detail">All definition-of-done checks passed.</span></div></div>
+      <div class="event-row"><span class="tone-dot system"></span><div class="event-meta"><div class="event-top"><span class="event-time mono">10:21:02</span><span class="event-title">Stage: Review</span></div><span class="event-detail">The pair moved this story into review.</span></div></div>
+      <div class="event-row"><span class="tone-dot system"></span><div class="event-meta"><div class="event-top"><span class="event-time mono">10:20:00</span><span class="event-title">Sprint started</span></div><span class="event-detail">Build Text Processing Suite — 3 stories.</span></div></div>
+    </aside>
+  </main>
+
+  <!-- STEER BAR -->
+  <footer class="steer-bar">
+    <span class="steer-label">Steer</span>
+    <input class="steer-input" type="text" value="" placeholder="Guidance for the pair, e.g. prefer stdlib only">
+    <span class="steer-count">0 / 4000</span>
+    <button class="steer-send">Send</button>
+    <span class="key-hints">
+      <span><kbd>Space</kbd> pause</span>
+      <span><kbd>d</kbd> diff</span>
+      <span><kbd>v</kbd> terminal</span>
+      <span><kbd>q</kbd> stop</span>
+    </span>
+  </footer>
+</div>
+</body>
+</html>

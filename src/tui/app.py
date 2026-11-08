@@ -11,10 +11,14 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from agent_core.events import AgentEvent, EventBus, EventType
+from agent_core.sanitize import strip_ansi
 
 
 class PairProgrammingTUI:
     """Rich terminal user interface visualizing dual-model pair programming and sprint progression."""
+
+    MAX_STORIES = 500
+    MAX_DIALOGUE_ENTRIES = 20
 
     def __init__(self, bus: EventBus, console: Optional[Console] = None) -> None:
         self.bus = bus
@@ -44,79 +48,79 @@ class PairProgrammingTUI:
         payload = event.payload
 
         if event.event_type == EventType.SPRINT_START:
-            self.epic_goal = payload.get("epic", self.epic_goal)
+            self.epic_goal = strip_ansi(payload.get("epic", self.epic_goal))
 
         elif event.event_type == EventType.BACKLOG_DECOMPOSED:
-            self.epic_goal = payload.get("epic", self.epic_goal)
+            self.epic_goal = strip_ansi(payload.get("epic", self.epic_goal))
             existing_ids = {s["id"] for s in self.stories}
             for item in payload.get("stories", []):
-                if item.get("id") and item["id"] not in existing_ids:
-                    self.stories.append({
-                        "id": item["id"],
-                        "title": item.get("title", "Story"),
-                        "status": item.get("status", "TODO"),
+                story_id = strip_ansi(item.get("id", ""))
+                if story_id and story_id not in existing_ids:
+                    self._append_story({
+                        "id": story_id,
+                        "title": strip_ansi(item.get("title", "Story")),
+                        "status": strip_ansi(item.get("status", "TODO")),
                     })
-                    existing_ids.add(item["id"])
+                    existing_ids.add(story_id)
             self._append_vm_log(f"[po] Decomposed epic into {payload.get('story_count', len(self.stories))} stories.")
 
         elif event.event_type == EventType.STORY_START:
-            self.active_story_title = payload.get("title", "Active Story")
+            self.active_story_title = strip_ansi(payload.get("title", "Active Story"))
             self.active_story_status = "RED_TESTS"
-            self.active_driver = payload.get("test_author") or payload.get("driver") or (event.source_model.split('/')[-1] if event.source_model else "claude-3-5")
-            self.active_navigator = payload.get("implementer") or payload.get("navigator") or "gemini-2.5"
+            self.active_driver = strip_ansi(payload.get("test_author") or payload.get("driver") or (event.source_model.split('/')[-1] if event.source_model else "claude-3-5"))
+            self.active_navigator = strip_ansi(payload.get("implementer") or payload.get("navigator") or "gemini-2.5")
             self.dod_state = {k: False for k in self.dod_state}
 
             # Update or append story in tracking list
+            story_id = strip_ansi(payload.get("story_id", ""))
             found = False
             for s in self.stories:
-                if s["id"] == payload.get("story_id"):
+                if s["id"] == story_id:
                     s["status"] = "IN_PROGRESS"
                     found = True
                     break
             if not found:
-                self.stories.append({
-                    "id": payload.get("story_id", "US-?"),
+                self._append_story({
+                    "id": story_id or "US-?",
                     "title": self.active_story_title,
                     "status": "IN_PROGRESS",
                 })
 
         elif event.event_type == EventType.STORY_STATUS_CHANGE:
-            new_status = payload.get("status", self.active_story_status)
+            new_status = strip_ansi(payload.get("status", self.active_story_status))
             if new_status == "GREEN_IMPL" and self.active_story_status != "GREEN_IMPL":
                 # Roles swap in Green Implementation phase
                 self.active_driver, self.active_navigator = self.active_navigator, self.active_driver
             self.active_story_status = new_status
 
         elif event.event_type == EventType.MODEL_MESSAGE:
-            model = event.source_model or "Unknown Model"
-            content = payload.get("content") or "[Tool Call Dispatched]"
-            role = payload.get("role") or "driver"
+            model = strip_ansi(event.source_model or "Unknown Model")
+            content = strip_ansi(payload.get("content") or "[Tool Call Dispatched]")
+            role = strip_ansi(payload.get("role") or "driver")
             self.dialogue_history.append({
                 "model": model,
                 "role": role,
                 "content": content,
                 "time": time.strftime("%H:%M:%S", time.localtime(event.timestamp)),
             })
-            if len(self.dialogue_history) > 20:
-                self.dialogue_history.pop(0)
+            self._trim_dialogue_history()
 
         elif event.event_type == EventType.CRITIQUE_RECEIVED:
-            model = event.source_model or "Reviewer"
+            model = strip_ansi(event.source_model or "Reviewer")
             self.dialogue_history.append({
                 "model": model,
                 "role": "reviewer",
-                "content": payload.get("critique", ""),
+                "content": strip_ansi(payload.get("critique", "")),
                 "time": time.strftime("%H:%M:%S", time.localtime(event.timestamp)),
             })
+            self._trim_dialogue_history()
 
         elif event.event_type == EventType.TOOL_RESULT:
-            output = payload.get("output", "")
-            tool = payload.get("tool_name", "tool")
+            output = strip_ansi(payload.get("output", ""))
+            tool = strip_ansi(payload.get("tool_name", "tool"))
             summary = output.strip().splitlines()
             first_line = summary[0] if summary else "Completed"
-            self.vm_logs.append(f"[{tool}] {first_line[:90]}")
-            if len(self.vm_logs) > 6:
-                self.vm_logs.pop(0)
+            self._append_vm_log(f"[{tool}] {first_line[:90]}")
 
         elif event.event_type == EventType.DOD_EVALUATION:
             self.dod_state = {
@@ -134,9 +138,7 @@ class PairProgrammingTUI:
                 line = f"[git] {payload.get('branch', '')} {verdict}"
             else:
                 line = f"[git] {payload.get('action', '')} {payload.get('branch', '')}"
-            self.vm_logs.append(line[:100])
-            if len(self.vm_logs) > 6:
-                self.vm_logs.pop(0)
+            self._append_vm_log(line)
 
         elif event.event_type == EventType.REFACTOR_ITERATION:
             attempt = payload.get("attempt", 1)
@@ -153,7 +155,7 @@ class PairProgrammingTUI:
             self._append_vm_log("[operator] Sprint RESUMED")
 
         elif event.event_type == EventType.OPERATOR_STEER:
-            guidance = payload.get("guidance", "")
+            guidance = strip_ansi(payload.get("guidance", ""))
             self._append_vm_log(f"[steer] Guidance queued: {guidance[:70]}")
 
         elif event.event_type == EventType.OPERATOR_STOP:
@@ -161,15 +163,27 @@ class PairProgrammingTUI:
             self._append_vm_log("[operator] Clean stop requested -- exiting sprint")
 
         elif event.event_type == EventType.STORY_DONE:
+            story_id = strip_ansi(payload.get("story_id", ""))
             for s in self.stories:
-                if s["id"] == payload.get("story_id"):
+                if s["id"] == story_id:
                     s["status"] = "DONE"
                     break
             self.active_story_status = "DONE"
 
+    def _append_story(self, story: Dict[str, Any]) -> None:
+        """Append one story and keep only the most recent sprint entries."""
+        self.stories.append(story)
+        if len(self.stories) > self.MAX_STORIES:
+            del self.stories[: len(self.stories) - self.MAX_STORIES]
+
+    def _trim_dialogue_history(self) -> None:
+        """Keep the rendered dialogue history bounded, including reviewer notes."""
+        if len(self.dialogue_history) > self.MAX_DIALOGUE_ENTRIES:
+            del self.dialogue_history[: len(self.dialogue_history) - self.MAX_DIALOGUE_ENTRIES]
+
     def _append_vm_log(self, line: str) -> None:
         """Append a line to the bounded VM log buffer."""
-        self.vm_logs.append(line[:100])
+        self.vm_logs.append(strip_ansi(line)[:100])
         if len(self.vm_logs) > 6:
             self.vm_logs.pop(0)
 
@@ -177,7 +191,7 @@ class PairProgrammingTUI:
         """Format model identifier cleanly to avoid mid-word slicing and ambiguity."""
         if not model:
             return "system"
-        m = model.strip()
+        m = strip_ansi(model).strip()
         if "claude" in m.lower():
             return "claude" if compact else "anthropic/claude"
         if "gemini" in m.lower():
@@ -268,11 +282,11 @@ class PairProgrammingTUI:
                 badge = "[bold #000000 on #22C55E]  DONE  [/]" if s["status"] == "DONE" else (
                     "[bold #000000 on #FACC15] ACTIVE [/]" if s["status"] == "IN_PROGRESS" else "[bold #38BDF8]  TODO  [/]"
                 )
-            backlog_table.add_row(badge, s["title"])
+            backlog_table.add_row(badge, Text(s["title"], style="bold #FFFFFF"))
 
         if not self.stories:
             empty_badge = "[bold #38BDF8]TODO[/]" if is_compact else "[bold #38BDF8]  TODO  [/]"
-            empty_msg = "[bold #FFFFFF]Backlog ready[/]" if is_compact else "[bold #FFFFFF]No active stories -- Backlog ready[/]"
+            empty_msg = Text("Backlog ready" if is_compact else "No active stories -- Backlog ready", style="bold #FFFFFF")
             backlog_table.add_row(empty_badge, empty_msg)
 
         # DoD Table with unambiguous status and icon state
@@ -295,12 +309,6 @@ class PairProgrammingTUI:
         for name, val in dod_items:
             if val:
                 icon = "[bold #000000 on #22C55E]PASS[/]" if is_compact else "[bold #000000 on #22C55E] PASS [/]"
-            elif "GREEN" in self.active_story_status and name in ["Syntax", "Syntax & Linter", "Sandbox Tests", "Sandbox Tests Pass"]:
-                icon = "[bold #000000 on #22C55E]PASS[/]" if is_compact else "[bold #000000 on #22C55E] PASS [/]"
-            elif "GREEN" in self.active_story_status and ("Review" in name or "LGTM" in name):
-                icon = "[bold #000000 on #FACC15]REVIEW[/]" if is_compact else "[bold #000000 on #FACC15] REVIEW [/]"
-            elif "RED" in self.active_story_status and ("Syntax" in name):
-                icon = "[bold #000000 on #22C55E]PASS[/]" if is_compact else "[bold #000000 on #22C55E] PASS [/]"
             else:
                 icon = "[bold #94A3B8 on #1E293B]WAIT[/]" if is_compact else "[bold #94A3B8 on #1E293B] WAIT [/]"
             dod_table.add_row(name, icon)
@@ -317,8 +325,6 @@ class PairProgrammingTUI:
                 Align.center(Text("*** STORY COMPLETE -- ALL GATES VERIFIED ***", style="bold #000000 on #22C55E")),
                 Text(""),
                 dod_table,
-                Text(""),
-                Align.center(Text("-> Press [c] Commit & Next Story", style="bold #22C55E")),
             )
         else:
             dod_content = dod_table
@@ -390,14 +396,21 @@ class PairProgrammingTUI:
         else:
             stage_activity_badge = "[bold #FFFFFF on #1E293B] IDLE [/]" if is_compact else "[bold #FFFFFF on #1E293B] STANDBY [/]"
 
+        stage_title = Text()
         if is_compact:
-            stage_title = f"[bold #38BDF8]Stage[/] {stage_activity_badge} | [bold #38BDF8]DRV:{driver_display}[/] [bold #FBBF24]NAV:{navigator_display}[/]"
+            stage_title.append("Stage ", style="bold #38BDF8")
+            stage_title.append_text(Text.from_markup(stage_activity_badge))
+            stage_title.append(" | DRV:", style="bold #38BDF8")
+            stage_title.append(driver_display, style="bold #38BDF8")
+            stage_title.append(" NAV:", style="bold #FBBF24")
+            stage_title.append(navigator_display, style="bold #FBBF24")
         else:
-            stage_title = (
-                f"[bold #38BDF8]Dual-Model Collaboration Stage[/]  {stage_activity_badge}  |  "
-                f"[bold #000000 on #38BDF8] DRIVER [/] [bold #38BDF8]{driver_display}[/]  "
-                f"[bold #94A3B8 on #1E293B] NAVIGATOR [/] [bold #FBBF24]{navigator_display}[/]"
-            )
+            stage_title.append("Dual-Model Collaboration Stage  ", style="bold #38BDF8")
+            stage_title.append_text(Text.from_markup(stage_activity_badge))
+            stage_title.append("  |  DRIVER ", style="bold #000000 on #38BDF8")
+            stage_title.append(driver_display, style="bold #38BDF8")
+            stage_title.append("  NAVIGATOR ", style="bold #94A3B8 on #1E293B")
+            stage_title.append(navigator_display, style="bold #FBBF24")
 
         layout["body"]["stage"]["dialogue"].update(
             Panel(dialogue_table, title=stage_title, border_style=stage_border)
@@ -421,7 +434,20 @@ class PairProgrammingTUI:
         )
 
         # 5. Footer with context-aware controls
-        if is_compact:
+        if self.steering_buffer:
+            footer_parts = [
+                (" STEER: ", "bold #000000 on #FACC15"),
+                (" ", ""),
+                (f"{self.steering_buffer}_", "bold #FFFFFF"),
+                ("    [Enter] Submit    [Esc] Cancel", "#94A3B8"),
+            ]
+        elif self.is_paused:
+            footer_parts = [
+                (" PAUSED: ", "bold #000000 on #FACC15"),
+                (" ", ""),
+                ("Sprint paused. Type to steer, [Space] Resume, [q] Exit", "bold #FACC15"),
+            ]
+        elif is_compact:
             footer_parts = [
                 (" [Space] Steer  ", "#E2E8F0"),
                 (" [d] Diff  ", "#E2E8F0"),
@@ -438,16 +464,9 @@ class PairProgrammingTUI:
                 (" Inspect Diff    ", "#E2E8F0"),
                 ("[v]", "bold #FACC15"),
                 (" Full Terminal    ", "#E2E8F0"),
-            ]
-            if all_passed:
-                footer_parts.extend([
-                    ("[c]", "bold #000000 on #22C55E"),
-                    (" Commit & Next Story    ", "bold #22C55E"),
-                ])
-            footer_parts.extend([
                 ("[q]", "bold #FFFFFF on #EF4444"),
                 (" Exit Cleanly", "bold #EF4444"),
-            ])
+            ]
 
         footer_text = Text.assemble(*footer_parts)
         footer_border = "#22C55E" if all_passed else "#38BDF8"

@@ -50,6 +50,41 @@ class TestSandboxRunner(unittest.TestCase):
         self.assertIn("TRUNCATED", res.stdout)
         self.assertLessEqual(len(res.stdout), 800)
 
+    def test_sensitive_env_vars_are_scrubbed_from_command_execution(self):
+        import os
+        old_env = {}
+        sensitive_vars = {
+            "ANTHROPIC_API_KEY": "sk-ant-secret",
+            "GEMINI_API_KEY": "gemini-secret",
+            "OPENAI_API_KEY": "openai-secret",
+            "OPENROUTER_API_KEY": "openrouter-secret",
+            "SERVICE_TOKEN": "token-123",
+            "CUSTOM_SECRET_KEY": "key-456",
+        }
+        for k, v in sensitive_vars.items():
+            old_env[k] = os.environ.get(k)
+            os.environ[k] = v
+
+        try:
+            res = self.runner.run_command(
+                "python -c \""
+                "import os; "
+                "print('ANTHROPIC:', os.environ.get('ANTHROPIC_API_KEY', 'CLEARED')); "
+                "print('GEMINI:', os.environ.get('GEMINI_API_KEY', 'CLEARED')); "
+                "print('TOKEN:', os.environ.get('SERVICE_TOKEN', 'CLEARED')); "
+                "\""
+            )
+            self.assertEqual(res.exit_code, 0)
+            self.assertIn("ANTHROPIC: CLEARED", res.stdout)
+            self.assertIn("GEMINI: CLEARED", res.stdout)
+            self.assertIn("TOKEN: CLEARED", res.stdout)
+        finally:
+            for k, prev in old_env.items():
+                if prev is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = prev
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,7 +10,7 @@ python -m pip install -e .
 PYTHONPATH=src python -m unittest discover tests
 # Windows PowerShell:
 $env:PYTHONPATH="src" ; python -m unittest discover tests
-# Expected: Ran 98 tests in ~26s OK (27 skipped if Docker daemon is not running)
+# Expected: Ran 118 tests in ~60s OK (27 skipped if Docker daemon is not running)
 
 # Run demo sprint (zero API cost, no keys needed)
 python main.py --mock
@@ -72,7 +72,7 @@ main.py
 | `src/tools/primitives.py` | `read_file`, `write_file`, `patch_file`, `list_dir`, `run_command` — all take `runner: SandboxRunner` as first arg. Never throw; always return `ToolResult`. |
 | `src/tools/registry.py` | `ToolRegistry`: introspects primitives, generates OpenAI-format JSON schema, dispatches tool calls by name. |
 | `src/tui/app.py` | `PairProgrammingTUI`: Rich-based dashboard. Subscribes to bus; stateless renders via `render_layout()`. |
-| `src/tui/keyboard.py` | `TerminalKeyboardController`: context manager, polls keypresses in background thread. `p`=pause, `r`=resume, `q`=stop, `s`=steer. Uses `msvcrt` on Windows, `select` on POSIX. |
+| `src/tui/keyboard.py` | `TerminalKeyboardController`: context manager, polls keypresses in background thread. `Space`=pause/resume, `q`=stop, `d`=inspect diff, `v`=full terminal, typing=inline steering. Uses `msvcrt` on Windows, `select` + `termios`/`tty` on POSIX. |
 | `src/server/bridge.py` | `WebEventBridge` + FastAPI app factory (`create_fastapi_app`). Runs engine in `asyncio.to_thread` to avoid blocking the event loop. |
 
 ## Key Conventions & Non-Obvious Patterns
@@ -81,7 +81,7 @@ main.py
 The project uses `src/` layout. Nothing in `src/` imports with a `src.` prefix — all imports are relative to `src/` (e.g., `from agent_core.types import ...`). `pyproject.toml` sets `pythonpath = ["src"]` for pytest, but `main.py` manually prepends `src` to `sys.path` at startup. For any script or test runner that doesn't go through `main.py`, you must set `PYTHONPATH=src`.
 
 ### Tests use `unittest`, not pytest
-The test command is `python -m unittest discover tests`, not `pytest`. While pytest can run these tests, the project's own invocations, CI expectations, and README all use `unittest`. The 27 tests target `tests/` directly; `tests/ux_simulation/` contains additional simulation tests.
+The test command is `python -m unittest discover tests`, not `pytest`. While pytest can run these tests, the project's own invocations, CI expectations, and README all use `unittest`. The suite targets `tests/` directly, and `tests/ux_simulation/` contains additional simulation tests (118 tests total).
 
 ### `ScriptedMockGateway` is FIFO per model
 When writing tests that exercise `PairProgrammingEngine`, you must queue responses in exact turn order, keyed by the model name string. The mock dequeues one response per `send_chat` call for that model. If the queue is exhausted, it raises `StopIteration`. Test setup in `test_e2e_mock_sprint.py` is the canonical example.
@@ -107,6 +107,8 @@ The `patch_file` tool (adapted from Aider's diff engine) does a literal string r
 ### Web mode runs the engine in a thread
 `create_fastapi_app` runs `engine.run_sprint()` via `asyncio.to_thread()`. The engine itself is synchronous and blocking — do not add `async` to engine methods. The `WebEventBridge._on_agent_event` handler uses `loop.call_soon_threadsafe` to safely push events from the engine thread to the async WebSocket queues.
 
+The web API requires `Authorization: Bearer <token>` on every `/api/*` request. Set `PAIR_PROGRAMMER_TOKEN` or use the generated token at `~/.pair_programmer/token`. The studio stores the token in the current tab's `sessionStorage`. WebSockets use the `bearer.<token>` subprotocol because browser clients cannot set handshake headers. Reject untrusted origins on WebSocket upgrades and state-changing REST requests; allow clients that omit `Origin`. Keep the CORS allowlist limited to the local Vite origins. The bridge caps REST traffic at 60 requests per minute per IP, WebSocket clients at 10, recent REST events at 300, and event history at 1000.
+
 ### Operator steering is consumed destructively
 `_consume_steering_notes()` drains the steering queue and formats it into a prompt suffix. Once consumed, the guidance is gone. The guidance is injected into the next GREEN or REFACTOR phase prompt, not the RED or REVIEW phases.
 
@@ -121,8 +123,9 @@ Models are specified as `provider/model-name` (e.g., `anthropic/claude-3-5-sonne
 | `GEMINI_API_KEY` | Google Gemini API key | — |
 | `OPENAI_API_KEY` | OpenAI key | — |
 | `OPENROUTER_API_KEY` | OpenRouter key (auto-routes to `https://openrouter.ai/api/v1`) | — |
+| `PAIR_PROGRAMMER_TOKEN` | Optional bearer token for the web API; generated token is used when unset | — |
 | `MODEL_A` | First model identifier | `anthropic/claude-3-5-sonnet` |
-| `MODEL_B` | Second model identifier | `gemini/gemini-2-5-flash` |
+| `MODEL_B` | Second model identifier | `gemini/gemini-2.5-flash` |
 | `SANDBOX_TIMEOUT_SECONDS` | Subprocess watchdog | `60` |
 | `SANDBOX_MODE` | `local_process` or `docker` | `local_process` |
 | `SANDBOX_IMAGE` | Docker image for sandbox | `python:3.11-slim` |

@@ -1,6 +1,7 @@
 """Visual TUI snapshot tests capturing SVG frames across the complete story lifecycle."""
 
 import io
+import tempfile
 import unittest
 from pathlib import Path
 from rich.console import Console
@@ -12,8 +13,11 @@ class TestTUISnapshots(unittest.TestCase):
     """Automates visual UX testing for the Phase 1 Rich Terminal User Interface."""
 
     def setUp(self) -> None:
-        self.snapshots_dir = Path(__file__).parent / "snapshots"
-        self.snapshots_dir.mkdir(parents=True, exist_ok=True)
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.snapshots_dir = Path(self.temp_dir.name)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
 
     def _render_and_export_snapshot(
         self,

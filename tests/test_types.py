@@ -40,6 +40,20 @@ class TestAgentTypes(unittest.TestCase):
         self.assertEqual(payload["content"], "I will inspect the file.")
         self.assertEqual(len(payload["tool_calls"]), 1)
         self.assertEqual(payload["tool_calls"][0]["function"]["name"], "read_file")
+        self.assertEqual(payload["tool_calls"][0]["function"]["arguments"], '{"path": "test.py"}')
+
+    def test_tool_role_message_provider_format_includes_call_id_and_output(self):
+        result = ToolResult(call_id="call_abc123", name="read_file", output="1 | x = 1\n")
+        msg = Message(role=Role.TOOL, content=result.output, tool_result=result)
+        payload = msg.to_provider_format()
+        self.assertEqual(
+            payload,
+            {
+                "role": "tool",
+                "tool_call_id": "call_abc123",
+                "content": "1 | x = 1\n",
+            },
+        )
 
     def test_definition_of_done_logic(self):
         dod = DefinitionOfDone()
@@ -78,6 +92,13 @@ class TestAgentTypes(unittest.TestCase):
         self.assertEqual(backlog.active_story.title, "Token Validation")
 
         story2.status = StoryStatus.DONE
+        for story in (story1, story2):
+            story.dod = DefinitionOfDone(
+                syntax_valid=True,
+                tests_passed=True,
+                cross_review_approved=True,
+                user_experience_verified=True,
+            )
         self.assertTrue(backlog.is_complete)
 
 

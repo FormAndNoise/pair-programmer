@@ -327,6 +327,44 @@ class TestDockerSandboxRunnerNoDaemon(unittest.TestCase):
         self.assertIsInstance(output, str)
         self.assertGreater(len(output), 0)
 
+    def test_build_docker_args_includes_name_and_hardened_flags(self) -> None:
+        """Verify generated docker args include unique name, cap-drop, and pids-limit."""
+        args = self.runner._build_docker_args(
+            command="python -V",
+            timeout=10,
+            extra_env={},
+            container_name="test-box-123",
+        )
+        self.assertIn("--name", args)
+        self.assertIn("test-box-123", args)
+        self.assertIn("--pids-limit", args)
+        self.assertIn("128", args)
+        self.assertIn("--cap-drop=ALL", args)
+        self.assertIn("--security-opt", args)
+        self.assertIn("no-new-privileges", args)
+
+    def test_build_docker_args_scrubs_sensitive_env(self) -> None:
+        """Verify sensitive environment variables are filtered out of container args."""
+        args = self.runner._build_docker_args(
+            command="python -V",
+            timeout=10,
+            extra_env={
+                "ANTHROPIC_API_KEY": "secret",
+                "SAFE_VAR": "visible",
+            },
+            container_name="test-box-123",
+        )
+        self.assertNotIn("-e", [a for a in args if "ANTHROPIC_API_KEY" in a])
+        self.assertIn("-e", args)
+        self.assertIn("SAFE_VAR=visible", args)
+
+    def test_docker_available_is_cached(self) -> None:
+        """Verify _docker_available does not repeatedly execute external checks."""
+        self.runner._cached_docker_available = True
+        self.assertTrue(self.runner._docker_available())
+        self.runner._cached_docker_available = False
+        self.assertFalse(self.runner._docker_available())
+
 
 if __name__ == "__main__":
     unittest.main()

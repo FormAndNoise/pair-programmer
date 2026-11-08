@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import re
+import threading
 import time
+from enum import Enum
 from typing import Any, Dict, List, Optional
 from agent_core.events import AgentEvent, EventBus, EventType
 from agent_core.types import (
@@ -20,6 +23,33 @@ from gateway.client import ModelGateway
 from sandbox.runner import SandboxRunner
 from tools.registry import ToolRegistry
 from .backlog import BacklogManager
+
+
+class SprintOutcome(Enum):
+    """Typed result of a sprint run so callers can distinguish outcomes."""
+
+    COMPLETED = "completed"
+    FAILED = "failed"
+    STOPPED = "stopped"
+
+    @property
+    def is_success(self) -> bool:
+        return self is SprintOutcome.COMPLETED
+
+    def __eq__(self, other: Any) -> bool:
+        # Preserve truthiness/back-compat with the legacy bool return:
+        # `outcome == True` / `assertTrue(outcome)` mean COMPLETED.
+        if isinstance(other, bool):
+            return self.is_success == other
+        if isinstance(other, SprintOutcome):
+            return self is other
+        return NotImplemented
+
+    def __bool__(self) -> bool:
+        return self.is_success
+
+    def __hash__(self) -> int:
+        return hash(self.value)
 
 
 class PairProgrammingEngine:
@@ -40,9 +70,11 @@ class PairProgrammingEngine:
         self.registry = registry
         self.gateway = gateway
         self.bus = bus
-        self._paused = False
-        self._stop_requested = False
+        self._paused = threading.Event()
+        self._stop_requested = threading.Event()
+        self._state_lock = threading.Lock()
         self._steering_guidance: List[str] = []
+        self._running = False
 
         # Wire operator steering and stop listeners
         self.bus.subscribe(EventType.OPERATOR_STEER, self._on_operator_steer)
@@ -51,97 +83,127 @@ class PairProgrammingEngine:
     @property
     def is_paused(self) -> bool:
         """Return True when the engine is paused by the operator."""
-        return self._paused
+        return self._paused.is_set()
 
     @property
     def stop_requested(self) -> bool:
         """Return True when the operator has requested a clean sprint exit."""
-        return self._stop_requested
+        return self._stop_requested.is_set()
+
+    @property
+    def is_running(self) -> bool:
+        """Return True while a sprint is executing on its engine thread."""
+        with self._state_lock:
+            return self._running
+
+    def _set_running(self, value: bool) -> None:
+        with self._state_lock:
+            self._running = value
 
     def _on_operator_steer(self, event: AgentEvent) -> None:
         """Capture operator steering guidance to inject into active prompts."""
         guidance = event.payload.get("guidance")
         if guidance:
-            self._steering_guidance.append(guidance)
+            with self._state_lock:
+                self._steering_guidance.append(guidance)
 
     def _on_operator_stop(self, event: AgentEvent) -> None:
         """Handle operator stop event."""
-        self._stop_requested = True
-        self._paused = False
+        self._stop_requested.set()
+        self._paused.clear()
 
     def _wait_if_paused(self) -> None:
-        """Block execution loop if paused by operator, exiting immediately on stop."""
-        while self._paused and not self._stop_requested:
-            time.sleep(0.05)
+        """Block execution loop if paused by operator, exiting immediately on stop.
+
+        Uses Event.wait() so a stop signal wakes the loop promptly instead
+        of busy-waiting with time.sleep().
+        """
+        while self._paused.is_set() and not self._stop_requested.is_set():
+            self._paused.wait(timeout=0.05)
 
     def pause(self) -> None:
         """Pause the pair programming engine (operator steering)."""
-        self._paused = True
+        self._paused.set()
         self.bus.publish(AgentEvent(event_type=EventType.OPERATOR_PAUSE))
 
     def resume(self) -> None:
         """Resume execution."""
-        self._paused = False
+        self._paused.clear()
         self.bus.publish(AgentEvent(event_type=EventType.OPERATOR_RESUME))
 
     def request_stop(self) -> None:
         """Signal the engine to stop cleanly at the next safe checkpoint."""
-        self._stop_requested = True
-        self._paused = False
+        self._stop_requested.set()
+        self._paused.clear()
         self.bus.publish(AgentEvent(event_type=EventType.OPERATOR_STOP))
+
+    def reset_stop(self) -> None:
+        """Clear the stop flag so a new sprint can start."""
+        self._stop_requested.clear()
 
     def _consume_steering_notes(self) -> str:
         """Drain and format any pending operator steering guidance."""
-        if not self._steering_guidance:
-            return ""
-        notes = "\nOperator Steering Guidance:\n" + "\n".join(f"- {g}" for g in self._steering_guidance)
-        self._steering_guidance.clear()
+        with self._state_lock:
+            if not self._steering_guidance:
+                return ""
+            notes = "\nOperator Steering Guidance:\n" + "\n".join(
+                f"- {g}" for g in self._steering_guidance
+            )
+            self._steering_guidance.clear()
         return f"\n\n{notes}"
 
     def _can_attempt_refactor(self, impl_model: str) -> bool:
         """Return True when the gateway can execute another remediation turn."""
-        if self._stop_requested:
+        if self._stop_requested.is_set():
             return False
         if hasattr(self.gateway, "has_queued_responses"):
             return bool(self.gateway.has_queued_responses(impl_model))
         return True
 
-    def run_sprint(self) -> bool:
-        """Execute all stories in the sprint backlog sequentially."""
-        self.bus.publish(
-            AgentEvent(
-                event_type=EventType.SPRINT_START,
-                payload={"epic": self.backlog_mgr.sprint.epic_goal},
-            )
-        )
+    def run_sprint(self) -> SprintOutcome:
+        """Execute all stories in the sprint backlog sequentially.
 
-        while not self.backlog_mgr.sprint.is_complete and not self._stop_requested:
-            story = self.backlog_mgr.sprint.active_story
-            if not story:
-                break
-
-            success = self.execute_story_cycle(story)
-            if not success:
-                self.bus.publish(
-                    AgentEvent(
-                        event_type=EventType.ERROR,
-                        payload={"story_id": story.id, "error": "Story cycle failed to achieve DoD."},
-                    )
+        Returns SprintOutcome.COMPLETED / FAILED / STOPPED. The enum keeps
+        legacy bool semantics (COMPLETED == True, other outcomes == False).
+        """
+        self._set_running(True)
+        try:
+            self.bus.publish(
+                AgentEvent(
+                    event_type=EventType.SPRINT_START,
+                    payload={"epic": self.backlog_mgr.sprint.epic_goal},
                 )
-                return False
-
-            self.backlog_mgr.sprint.advance()
-
-        if self._stop_requested:
-            return False
-
-        self.bus.publish(
-            AgentEvent(
-                event_type=EventType.SPRINT_COMPLETE,
-                payload={"epic": self.backlog_mgr.sprint.epic_goal},
             )
-        )
-        return True
+
+            while not self.backlog_mgr.sprint.is_complete and not self._stop_requested.is_set():
+                story = self.backlog_mgr.sprint.active_story
+                if not story:
+                    break
+
+                success = self.execute_story_cycle(story)
+                if not success:
+                    self.bus.publish(
+                        AgentEvent(
+                            event_type=EventType.ERROR,
+                            payload={"story_id": story.id, "error": "Story cycle failed to achieve DoD."},
+                        )
+                    )
+                    return SprintOutcome.FAILED
+
+                self.backlog_mgr.sprint.advance()
+
+            if self._stop_requested.is_set():
+                return SprintOutcome.STOPPED
+
+            self.bus.publish(
+                AgentEvent(
+                    event_type=EventType.SPRINT_COMPLETE,
+                    payload={"epic": self.backlog_mgr.sprint.epic_goal},
+                )
+            )
+            return SprintOutcome.COMPLETED
+        finally:
+            self._set_running(False)
 
     def execute_story_cycle(self, story: UserStory) -> bool:
         """Execute one complete Red-Green-Refactor Ping-Pong cycle on a story."""
@@ -196,15 +258,16 @@ class PairProgrammingEngine:
         )
 
         self._wait_if_paused()
-        if self._stop_requested:
+        if self._stop_requested.is_set():
             return False
         red_resp = self._call_model_and_dispatch_tools(test_model, red_prompt, PairRole.DRIVER)
+        story.pinned_test_hashes = self.backlog_mgr.snapshot_test_hashes(self.runner)
 
         # -------------------------------------------------------------
         # 2. GREEN PHASE: Implementer writes code to turn tests green
         # -------------------------------------------------------------
         self._wait_if_paused()
-        if self._stop_requested:
+        if self._stop_requested.is_set():
             return False
         story.status = StoryStatus.GREEN_IMPL
         self.bus.publish(
@@ -215,9 +278,16 @@ class PairProgrammingEngine:
             )
         )
 
+        criteria_block = (
+            "Acceptance Criteria:\n" + "\n".join(f"- {c}" for c in story.acceptance_criteria) + "\n"
+            if story.acceptance_criteria
+            else ""
+        )
         green_prompt = (
             f"You are the Implementer ({impl_model}).\n"
             f"User Story: {story.title}\n"
+            f"Human Interaction & UX Contract: {story.human_interaction_contract}\n"
+            f"{criteria_block}"
             f"The Test Author ({test_model}) wrote tests with the following thought:\n{red_resp.content}\n\n"
             "Task: Implement the necessary code in `src/` to satisfy the tests and UX contract. "
             "Use `write_file` or `patch_file` to write the implementation."
@@ -230,7 +300,7 @@ class PairProgrammingEngine:
         # 3. REVIEW PHASE: Test Author reviews Implementer's work
         # -------------------------------------------------------------
         self._wait_if_paused()
-        if self._stop_requested:
+        if self._stop_requested.is_set():
             return False
         review_resp, is_approved = self._run_review_phase(story, test_model, impl_model, green_resp.content)
 
@@ -255,7 +325,7 @@ class PairProgrammingEngine:
         ):
             refactor_attempt += 1
             self._wait_if_paused()
-            if self._stop_requested:
+            if self._stop_requested.is_set():
                 return False
 
             story.status = StoryStatus.REFACTOR
@@ -281,6 +351,7 @@ class PairProgrammingEngine:
                         "syntax_valid": dod.syntax_valid,
                         "tests_passed": dod.tests_passed,
                         "cross_review_approved": dod.cross_review_approved,
+                        "user_experience_verified": dod.user_experience_verified,
                         "diagnostics": dod.notes or "",
                     },
                 )
@@ -294,7 +365,8 @@ class PairProgrammingEngine:
                 "The Definition of Done gate did not pass:\n"
                 f"- Syntax Valid: {dod.syntax_valid}\n"
                 f"- Sandbox Tests Passed: {dod.tests_passed}\n"
-                f"- Reviewer Approved (LGTM): {dod.cross_review_approved}\n\n"
+                f"- Reviewer Approved (LGTM): {dod.cross_review_approved}\n"
+                f"- UX Contract Verified: {dod.user_experience_verified}\n\n"
                 f"Sandbox Verification Output:\n{dod.notes or 'No diagnostic output.'}\n\n"
                 f"Reviewer ({test_model}) Critique:\n{review_resp.content or 'No critique provided.'}\n\n"
                 "Task: Fix all failing tests, syntax errors, and reviewer concerns using `write_file` or `patch_file`."
@@ -304,7 +376,7 @@ class PairProgrammingEngine:
             green_resp = self._call_model_and_dispatch_tools(impl_model, refactor_prompt, PairRole.DRIVER)
 
             self._wait_if_paused()
-            if self._stop_requested:
+            if self._stop_requested.is_set():
                 return False
             review_resp, is_approved = self._run_review_phase(story, test_model, impl_model, green_resp.content)
 
@@ -332,6 +404,14 @@ class PairProgrammingEngine:
         )
 
         if dod.is_complete:
+            story.status = StoryStatus.DONE
+            self.bus.publish(
+                AgentEvent(
+                    event_type=EventType.STORY_STATUS_CHANGE,
+                    source_model=test_model,
+                    payload={"story_id": story.id, "status": "DONE"},
+                )
+            )
             self.bus.publish(
                 AgentEvent(
                     event_type=EventType.STORY_DONE,
@@ -345,7 +425,73 @@ class PairProgrammingEngine:
             return True
 
         story.status = StoryStatus.BLOCKED
+        self.bus.publish(
+            AgentEvent(
+                event_type=EventType.STORY_STATUS_CHANGE,
+                source_model=test_model,
+                payload={"story_id": story.id, "status": "BLOCKED"},
+            )
+        )
         return False
+
+    def _collect_workspace_snapshot(
+        self,
+        max_total_chars: int = 12000,
+        max_file_chars: int = 4000,
+    ) -> str:
+        """Collect a bounded text snapshot of confined workspace files for review."""
+        sections: List[str] = []
+        used_chars = 0
+        try:
+            candidates = sorted(self.runner.workspace_dir.rglob("*"))
+        except Exception:
+            return "[Workspace unreadable]"
+
+        for candidate in candidates:
+            try:
+                resolved = self.runner.resolve_path(candidate)
+                if not resolved.is_file():
+                    continue
+                rel = resolved.relative_to(self.runner.workspace_dir)
+                if any(part.startswith(".") or part == "__pycache__" for part in rel.parts):
+                    continue
+                content = resolved.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+
+            if len(content) > max_file_chars:
+                content = content[:max_file_chars] + "\n... [truncated]"
+            block = f"=== {rel.as_posix()} ===\n{content}"
+            if used_chars + len(block) > max_total_chars:
+                sections.append("... [remaining workspace files omitted]")
+                break
+            sections.append(block)
+            used_chars += len(block)
+
+        return "\n\n".join(sections) if sections else "[No workspace files present]"
+
+    @staticmethod
+    def _is_review_approved(content: Optional[str]) -> bool:
+        """Return True when review text contains an un-negated standalone LGTM verdict."""
+        text = content or ""
+        if not re.search(r"\bLGTM\b", text, flags=re.IGNORECASE):
+            return False
+        if re.search(r"\b(?:not|no|never|almost|without|hardly|barely)\s+['\"`]*lgtm\b", text, flags=re.IGNORECASE):
+            return False
+        if re.search(
+            r"\b(?:not|never|cannot|can't|won't|don't|do\s+not|didn't|isn't|unable\s+to|refuse\s+to|fail\s+to|hardly|barely)\b"
+            r"[^.!?;,\n]{0,80}\blgtm\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            return False
+        if re.search(
+            r"\blgtm\b[^.!?;,\n]{0,40}\b(?:but|except|however|unless|issue|fail|bug|error|problem)\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            return False
+        return True
 
     def _run_review_phase(
         self,
@@ -364,10 +510,13 @@ class PairProgrammingEngine:
             )
         )
 
+        workspace_snapshot = self._collect_workspace_snapshot()
         review_prompt = (
             f"You are the Reviewer ({test_model}).\n"
             f"User Story: {story.title}\n"
+            f"Human Interaction & UX Contract: {story.human_interaction_contract}\n"
             f"Implementer ({impl_model}) response:\n{impl_content}\n\n"
+            f"Workspace Artifacts:\n{workspace_snapshot}\n\n"
             "Task: Review the code for human usability, clarity, and defensive error handling. "
             "If it meets all quality bars, end your response with 'LGTM'. Otherwise, state required fixes."
         )
@@ -385,7 +534,15 @@ class PairProgrammingEngine:
             )
         )
 
-        is_approved = "LGTM" in (review_resp.content or "").upper()
+        # Enforce that reviewer and implementer cannot be the same model,
+        # and approval must come from test_model
+        if test_model == impl_model:
+            is_approved = False
+        else:
+            is_approved = self._is_review_approved(review_resp.content)
+            if review_resp.model_name and review_resp.model_name != test_model:
+                is_approved = False
+
         return review_resp, is_approved
 
     def _call_model_and_dispatch_tools(
@@ -394,22 +551,34 @@ class PairProgrammingEngine:
         user_prompt: str,
         role: PairRole,
     ) -> Message:
-        """Invoke a model, publish thinking, and execute returned tool calls."""
-        messages = [Message(role=Role.USER, content=user_prompt)]
+        """Invoke a model in a bounded tool-execution loop until completion or turn limit."""
+        messages: List[Message] = [Message(role=Role.USER, content=user_prompt)]
         tools = self.registry.get_definitions()
+        max_turns = max(1, self.config.max_turns_per_story)
+        last_resp: Optional[Message] = None
 
-        resp = self.gateway.send_chat(model=model, messages=messages, tools=tools)
-        resp.pair_role = role
+        for turn in range(max_turns):
+            if turn > 0:
+                self._wait_if_paused()
+                if self._stop_requested.is_set() and last_resp is not None:
+                    return last_resp
 
-        self.bus.publish(
-            AgentEvent(
-                event_type=EventType.MODEL_MESSAGE,
-                source_model=model,
-                payload={"content": resp.content, "role": role.value},
+            resp = self.gateway.send_chat(model=model, messages=list(messages), tools=tools)
+            resp.pair_role = role
+            last_resp = resp
+
+            self.bus.publish(
+                AgentEvent(
+                    event_type=EventType.MODEL_MESSAGE,
+                    source_model=model,
+                    payload={"content": resp.content, "role": role.value},
+                )
             )
-        )
 
-        if resp.tool_calls:
+            if not resp.tool_calls:
+                return resp
+
+            messages.append(resp)
             for tc in resp.tool_calls:
                 self.bus.publish(
                     AgentEvent(
@@ -432,5 +601,10 @@ class PairProgrammingEngine:
                         },
                     )
                 )
+                messages.append(Message(role=Role.TOOL, content=result.output, tool_result=result))
 
-        return resp
+            if getattr(self.gateway, "single_shot_tools", False):
+                return resp
+
+        assert last_resp is not None
+        return last_resp

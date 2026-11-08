@@ -10,10 +10,12 @@ from __future__ import annotations
 import shutil
 import subprocess
 import time
+import uuid
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from sandbox.runner import ExecutionResult, SandboxRunner
+from agent_core.sanitize import strip_ansi
+from sandbox.runner import ExecutionResult, SandboxRunner, _scrub_environment
 
 
 # Sentinel returned when Docker is not reachable on this host.
@@ -60,6 +62,7 @@ class DockerSandboxRunner:
         self.max_output_chars = max_output_chars
         self.image = image
         self.docker_binary = docker_binary
+        self._cached_docker_available: Optional[bool] = None
 
         # Ensure workspace exists on the host before any mount attempt.
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -95,12 +98,17 @@ class DockerSandboxRunner:
         command: str,
         timeout_seconds: Optional[int] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        *,
+        trusted_env: Optional[Dict[str, str]] = None,
     ) -> ExecutionResult:
         """Run a shell command inside a fresh, disposable Docker container.
 
         The container is air-gapped (``--network none``), memory-capped at
         512 MiB, and limited to 1 CPU. It is automatically removed after the
         command exits or times out.
+
+        Use ``trusted_env`` only for harness-owned values needed by DoD checks.
+        The model-facing tool interface cannot set this environment mapping.
 
         Returns ExecutionResult with ``timed_out=True`` when the watchdog fires.
         Returns a failure result when Docker is not available.
@@ -110,7 +118,22 @@ class DockerSandboxRunner:
             return result
 
         timeout = timeout_seconds or self.default_timeout
-        docker_args = self._build_docker_args(command, timeout, extra_env or {})
+        container_name = f"pp-sandbox-{uuid.uuid4().hex[:12]}"
+        combined_env = dict(extra_env or {})
+        combined_env.update(trusted_env or {})
+        trusted_loader_keys = frozenset((trusted_env or {}).keys()) & frozenset({"PYTHONPATH"})
+        safe_env = _scrub_environment(
+            combined_env,
+            trusted_loader_keys=trusted_loader_keys,
+            reject_path=True,
+        )
+        docker_args = self._build_docker_args(
+            command,
+            timeout,
+            safe_env,
+            container_name=container_name,
+            trusted_loader_keys=trusted_loader_keys,
+        )
 
         timed_out = False
         start_time = time.perf_counter()
@@ -132,8 +155,8 @@ class DockerSandboxRunner:
             stdout = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
             stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
             stderr += f"\n[WATCHDOG] Container terminated after exceeding {timeout}s."
-            # Best-effort: kill any still-running container that matched our name.
-            self._kill_escaped_container(command)
+            # Targeted kill for the specific container name
+            self._kill_escaped_container(container_name)
 
         except FileNotFoundError:
             # docker binary not found at all
@@ -163,7 +186,11 @@ class DockerSandboxRunner:
 
     def _docker_available(self) -> bool:
         """Return True when the Docker binary exists and the daemon responds."""
+        if self._cached_docker_available is not None:
+            return self._cached_docker_available
+
         if shutil.which(self.docker_binary) is None:
+            self._cached_docker_available = False
             return False
         try:
             result = subprocess.run(
@@ -171,9 +198,10 @@ class DockerSandboxRunner:
                 capture_output=True,
                 timeout=5,
             )
-            return result.returncode == 0
+            self._cached_docker_available = (result.returncode == 0)
         except Exception:
-            return False
+            self._cached_docker_available = False
+        return self._cached_docker_available
 
     def _ensure_image_available(self) -> None:
         """Pull the configured image if it is not already present locally.
@@ -202,6 +230,8 @@ class DockerSandboxRunner:
         command: str,
         timeout: int,
         extra_env: Dict[str, str],
+        container_name: Optional[str] = None,
+        trusted_loader_keys: frozenset[str] = frozenset(),
     ) -> List[str]:
         """Build the ``docker run`` argument list for the given command."""
         # Sanitize workspace path for Docker volume syntax (no trailing slash)
@@ -213,45 +243,48 @@ class DockerSandboxRunner:
             "--network", "none",               # Air-gapped: no outbound traffic
             "--memory", "512m",                # Cap resident memory
             "--cpus", "1.0",                   # Limit to 1 logical CPU
+            "--pids-limit", "128",             # Limit child processes against fork bombs
+            "--cap-drop=ALL",                  # Drop all capabilities
+            "--security-opt", "no-new-privileges",  # Block privilege escalation
             "--stop-timeout", str(timeout),    # Docker stop grace period
             "-v", f"{host_path}:/workspace",   # Bind-mount the workspace
             "-w", "/workspace",                # Set working directory
         ]
 
-        # Forward selected environment variables into the container.
-        for key, value in extra_env.items():
+        if container_name:
+            args += ["--name", container_name]
+
+        # Forward scrubbed environment variables into the container.
+        scrubbed_env = _scrub_environment(
+            extra_env,
+            trusted_loader_keys=trusted_loader_keys,
+            reject_path=True,
+        )
+        for key, value in scrubbed_env.items():
             args += ["-e", f"{key}={value}"]
 
-        # Always set PYTHONUNBUFFERED for clean stdout streaming.
-        args += ["-e", "PYTHONUNBUFFERED=1"]
+        # Always set PYTHONUNBUFFERED and PAGER for clean execution.
+        args += ["-e", "PYTHONUNBUFFERED=1", "-e", "PAGER=cat"]
 
         args += [self.image, "sh", "-c", command]
         return args
 
-    def _kill_escaped_container(self, command: str) -> None:
-        """Attempt to kill any container still running after a timeout.
+    def _kill_escaped_container(self, container_identifier: str) -> None:
+        """Attempt to kill the specified container after a timeout.
 
-        Uses ``docker ps`` to find containers running our image and stop them.
-        This is a best-effort safety net — failures are silently ignored.
+        Targeted explicitly to container_identifier to avoid killing unrelated containers.
         """
         try:
-            ps = subprocess.run(
-                [
-                    self.docker_binary, "ps", "-q",
-                    "--filter", f"ancestor={self.image}",
-                    "--filter", "status=running",
-                ],
+            subprocess.run(
+                [self.docker_binary, "kill", container_identifier],
                 capture_output=True,
-                text=True,
                 timeout=5,
             )
-            container_ids = ps.stdout.strip().splitlines()
-            for cid in container_ids:
-                subprocess.run(
-                    [self.docker_binary, "kill", cid.strip()],
-                    capture_output=True,
-                    timeout=5,
-                )
+            subprocess.run(
+                [self.docker_binary, "rm", "-f", container_identifier],
+                capture_output=True,
+                timeout=5,
+            )
         except Exception:
             pass
 
@@ -260,6 +293,7 @@ class DockerSandboxRunner:
 
         Identical logic to SandboxRunner._sanitize_and_truncate.
         """
+        text = strip_ansi(text)
         if len(text) <= self.max_output_chars:
             return text
 

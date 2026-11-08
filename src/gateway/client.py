@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import re
 import time
 from typing import Any, Dict, List, Optional
 import httpx
@@ -32,19 +34,97 @@ class ModelGateway:
 
     def get_api_key(self, provider: str) -> Optional[str]:
         """Fetch API key from explicit config or environment variables."""
+        normalized = provider.lower()
         env_map = {
             "anthropic": "ANTHROPIC_API_KEY",
+            "claude": "ANTHROPIC_API_KEY",
             "gemini": "GEMINI_API_KEY",
             "google": "GEMINI_API_KEY",
             "openai": "OPENAI_API_KEY",
             "openrouter": "OPENROUTER_API_KEY",
+            "groq": "GROQ_API_KEY",
         }
-        key_var = env_map.get(provider.lower())
-        if provider in self.api_keys:
-            return self.api_keys[provider]
+        key_var = env_map.get(normalized)
+        lower_keys = {str(k).lower(): v for k, v in self.api_keys.items()}
+        if normalized in lower_keys:
+            return lower_keys[normalized]
         if key_var and key_var in os.environ:
             return os.environ[key_var]
         return None
+
+    def require_api_key(self, provider: str, env_var: str) -> str:
+        """Return the API key or raise a named error before any HTTP call."""
+        key = self.get_api_key(provider)
+        if not key:
+            raise RuntimeError(
+                f"Missing API key for provider '{provider}': "
+                f"set {env_var} or configure ModelGateway(api_keys={{'{provider}': ...}}) "
+                "before calling send_chat."
+            )
+        return key
+
+    @staticmethod
+    def _is_retryable_status(status_code: int) -> bool:
+        """Return True only for retryable provider responses (429/5xx/timeout)."""
+        return status_code == 429 or 500 <= status_code <= 599
+
+    @staticmethod
+    def _status_code_of(exc: Exception) -> Optional[int]:
+        """Extract an HTTP status code from httpx/litellm exceptions when present."""
+        for attr in ("status_code", "status", "code"):
+            value = getattr(exc, attr, None)
+            if isinstance(value, int):
+                return value
+        response = getattr(exc, "response", None)
+        if response is not None:
+            value = getattr(response, "status_code", None)
+            if isinstance(value, int):
+                return value
+        match = re.search(r"\b([45]\d{2})\b", str(exc))
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _is_retryable_exception(exc: Exception) -> bool:
+        """Classify an exception as retryable (429/5xx/timeout/network only)."""
+        status = ModelGateway._status_code_of(exc)
+        if status is not None:
+            return ModelGateway._is_retryable_status(status)
+        if isinstance(exc, (TimeoutError,)):
+            return True
+        name = type(exc).__name__.lower()
+        if "timeout" in name or "connect" in name:
+            return True
+        return False
+
+    @staticmethod
+    def _redact(text: str, limit: int = 500) -> str:
+        """Truncate provider error bodies and strip anything key-like."""
+        truncated = str(text)[:limit]
+        truncated = re.sub(
+            r"(sk-(?:ant-|or-v1-|proj-|live-)?[A-Za-z0-9_-]{8,}|AIza[A-Za-z0-9_-]{8,}|xox[baprs]-[A-Za-z0-9-]{8,})",
+            "[REDACTED]",
+            truncated,
+        )
+        return truncated
+
+    @staticmethod
+    def _retry_delay(attempt: int) -> float:
+        """Exponential backoff with jitter, capped to keep total wait bounded."""
+        base = min(8.0, 2 ** attempt)
+        return base + random.uniform(0, 0.5)
+
+    def _should_retry(self, exc: Exception, attempt: int) -> bool:
+        if attempt >= max(1, self.max_retries) - 1:
+            return False
+        return self._is_retryable_exception(exc)
+
+    def _sleep_before_retry(self, attempt: int) -> None:
+        time.sleep(self._retry_delay(attempt))
 
     def send_chat(
         self,
@@ -88,14 +168,41 @@ class ModelGateway:
                 for t in tools
             ]
 
+        provider = model.split("/")[0].lower() if "/" in model else "openai"
+        env_map = {
+            "anthropic": "ANTHROPIC_API_KEY",
+            "claude": "ANTHROPIC_API_KEY",
+            "gemini": "GEMINI_API_KEY",
+            "google": "GEMINI_API_KEY",
+            "openai": "OPENAI_API_KEY",
+            "openrouter": "OPENROUTER_API_KEY",
+            "groq": "GROQ_API_KEY",
+        }
+        api_key = self.get_api_key(provider)
+        litellm_kwargs: Dict[str, Any] = {
+            "model": model,
+            "messages": formatted_messages,
+            "tools": formatted_tools,
+            "timeout": self.timeout,
+        }
+        if api_key:
+            litellm_kwargs["api_key"] = api_key
+        else:
+            # Only enforce the missing-key error when no explicit key and no
+            # environment key; LiteLLM itself may still resolve credentials,
+            # so we warn by raising only for known managed providers.
+            if provider in env_map:
+                raise RuntimeError(
+                    f"Missing API key for provider '{provider}': "
+                    f"set {env_map[provider]} before calling send_chat."
+                )
+        base_url = os.getenv("OPENAI_BASE_URL")
+        if base_url and provider in ("openai", "openrouter"):
+            litellm_kwargs["base_url"] = base_url
+
         for attempt in range(self.max_retries):
             try:
-                response = litellm.completion(
-                    model=model,
-                    messages=formatted_messages,
-                    tools=formatted_tools,
-                    timeout=self.timeout,
-                )
+                response = litellm.completion(**litellm_kwargs)
                 choice = response.choices[0].message
                 content = choice.content or ""
                 tool_calls: List[ToolCall] = []
@@ -119,9 +226,11 @@ class ModelGateway:
                     model_name=model,
                 )
             except Exception as e:
-                if attempt == self.max_retries - 1:
-                    raise RuntimeError(f"LiteLLM call failed for model '{model}' after {self.max_retries} attempts: {e}")
-                time.sleep(2 ** attempt)
+                if not self._should_retry(e, attempt):
+                    raise RuntimeError(
+                        f"LiteLLM call failed for model '{model}': {self._redact(e)}"
+                    ) from e
+                self._sleep_before_retry(attempt)
 
         raise RuntimeError("Unreachable loop exit in _send_via_litellm")
 
@@ -155,7 +264,7 @@ class ModelGateway:
         system_prompt: Optional[str] = None,
     ) -> Message:
         """Call the Anthropic Messages API directly without LiteLLM."""
-        api_key = self.get_api_key("anthropic") or ""
+        api_key = self.require_api_key("anthropic", "ANTHROPIC_API_KEY")
         url = "https://api.anthropic.com/v1/messages"
         headers = {
             "x-api-key": api_key,
@@ -163,10 +272,21 @@ class ModelGateway:
             "Content-Type": "application/json",
         }
 
+        anthropic_messages: List[Dict[str, Any]] = []
+        for msg in messages:
+            converted = self._to_anthropic_message(msg)
+            if (
+                anthropic_messages
+                and anthropic_messages[-1]["role"] == converted["role"] == "user"
+            ):
+                anthropic_messages[-1]["content"].extend(converted["content"])
+            else:
+                anthropic_messages.append(converted)
+
         payload: Dict[str, Any] = {
             "model": model_name,
             "max_tokens": 4096,
-            "messages": [self._to_anthropic_message(msg) for msg in messages],
+            "messages": anthropic_messages,
         }
         if system_prompt:
             payload["system"] = system_prompt
@@ -207,9 +327,11 @@ class ModelGateway:
                         model_name=f"anthropic/{model_name}",
                     )
                 except Exception as e:
-                    if attempt == self.max_retries - 1:
-                        raise RuntimeError(f"Anthropic API call failed for '{model_name}': {e}") from e
-                    time.sleep(2 ** attempt)
+                    if not self._should_retry(e, attempt):
+                        raise RuntimeError(
+                            f"Anthropic API call failed for '{model_name}': {self._redact(e)}"
+                        ) from e
+                    self._sleep_before_retry(attempt)
 
         raise RuntimeError("Unreachable loop exit in _send_via_anthropic")
 
@@ -221,15 +343,26 @@ class ModelGateway:
         system_prompt: Optional[str] = None,
     ) -> Message:
         """Call the Google Gemini generateContent API directly without LiteLLM."""
-        api_key = self.get_api_key("gemini") or ""
+        api_key = self.require_api_key("gemini", "GEMINI_API_KEY")
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
         headers = {
             "x-goog-api-key": api_key,
             "Content-Type": "application/json",
         }
 
+        gemini_contents: List[Dict[str, Any]] = []
+        for msg in messages:
+            converted = self._to_gemini_content(msg)
+            if (
+                gemini_contents
+                and gemini_contents[-1]["role"] == converted["role"] == "user"
+            ):
+                gemini_contents[-1]["parts"].extend(converted["parts"])
+            else:
+                gemini_contents.append(converted)
+
         payload: Dict[str, Any] = {
-            "contents": [self._to_gemini_content(msg) for msg in messages],
+            "contents": gemini_contents,
         }
         if system_prompt:
             payload["systemInstruction"] = {"parts": [{"text": system_prompt}]}
@@ -274,9 +407,11 @@ class ModelGateway:
                         model_name=f"gemini/{model_name}",
                     )
                 except Exception as e:
-                    if attempt == self.max_retries - 1:
-                        raise RuntimeError(f"Gemini API call failed for '{model_name}': {e}") from e
-                    time.sleep(2 ** attempt)
+                    if not self._should_retry(e, attempt):
+                        raise RuntimeError(
+                            f"Gemini API call failed for '{model_name}': {self._redact(e)}"
+                        ) from e
+                    self._sleep_before_retry(attempt)
 
         raise RuntimeError("Unreachable loop exit in _send_via_gemini")
 
@@ -345,7 +480,11 @@ class ModelGateway:
         system_prompt: Optional[str] = None,
     ) -> Message:
         """Call any OpenAI-compatible endpoint (OpenAI, OpenRouter, Groq, vLLM, Ollama)."""
-        api_key = self.get_api_key(provider) or ""
+        env_var = {
+            "openrouter": "OPENROUTER_API_KEY",
+            "groq": "GROQ_API_KEY",
+        }.get(provider.lower(), "OPENAI_API_KEY")
+        api_key = self.require_api_key(provider, env_var)
         provider_base_urls = {
             "openrouter": "https://openrouter.ai/api/v1",
             "groq": "https://api.groq.com/openai/v1",
@@ -410,8 +549,10 @@ class ModelGateway:
                         model_name=model_name,
                     )
                 except Exception as e:
-                    if attempt == self.max_retries - 1:
-                        raise RuntimeError(f"Direct API call failed for '{model_name}' at '{base_url}': {e}") from e
-                    time.sleep(2 ** attempt)
+                    if not self._should_retry(e, attempt):
+                        raise RuntimeError(
+                            f"Direct API call failed for '{model_name}' at '{base_url}': {self._redact(e)}"
+                        ) from e
+                    self._sleep_before_retry(attempt)
 
         raise RuntimeError("Unreachable loop exit in _send_via_openai_compatible")
