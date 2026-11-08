@@ -20,6 +20,24 @@ def _resolve_call_id(call_id: Optional[str]) -> str:
     return cleaned if cleaned else f"call_{uuid.uuid4().hex}"
 
 
+def _reject_symlink(runner: SandboxRunner, target_path: str) -> None:
+    """Raise PermissionError if target_path or any workspace parent is a symlink."""
+    raw = Path(target_path)
+    candidate = raw if raw.is_absolute() else (runner.workspace_dir / raw)
+    if candidate.is_symlink():
+        raise PermissionError(
+            f"Symlink access rejected: '{target_path}' is a symbolic link."
+        )
+    # Check intermediate parents up to workspace_dir
+    current = candidate.parent
+    while current != runner.workspace_dir and current != current.parent:
+        if current.is_symlink():
+            raise PermissionError(
+                f"Symlink traversal rejected: parent directory '{current.name}' is a symbolic link."
+            )
+        current = current.parent
+
+
 def read_file(
     runner: SandboxRunner,
     path: str,
@@ -37,6 +55,7 @@ def read_file(
                 output="Error: offset and limit must be zero or greater.",
                 is_error=True,
             )
+        _reject_symlink(runner, path)
         resolved = runner.resolve_path(path)
         if not resolved.exists():
             return ToolResult(
@@ -63,6 +82,7 @@ def read_file(
             )
 
         with open(resolved, "r", encoding="utf-8", errors="replace") as f:
+            Path(f.name).resolve().relative_to(runner.workspace_dir)
             lines = f.readlines()
 
         total_lines = len(lines)
@@ -112,6 +132,7 @@ def write_file(
                 is_error=True,
             )
 
+        _reject_symlink(runner, path)
         resolved = runner.resolve_path(path)
         if resolved.exists() and not overwrite:
             return ToolResult(
@@ -132,7 +153,9 @@ def write_file(
                 prefix=".tmp_write_",
             ) as f:
                 tmp_path = Path(f.name)
+                tmp_path.resolve().relative_to(runner.workspace_dir)
                 f.write(content)
+            _reject_symlink(runner, path)
             os.replace(tmp_path, resolved)
             tmp_path = None
         finally:
@@ -187,6 +210,7 @@ def patch_file(
                 is_error=True,
             )
 
+        _reject_symlink(runner, path)
         resolved = runner.resolve_path(path)
         if not resolved.exists():
             return ToolResult(
@@ -205,6 +229,7 @@ def patch_file(
             )
 
         with open(resolved, "r", encoding="utf-8", errors="replace") as f:
+            Path(f.name).resolve().relative_to(runner.workspace_dir)
             original = f.read()
 
         if "\x00" in original:
@@ -318,15 +343,23 @@ def list_dir(
         entries = []
         if not recursive:
             for item in sorted(resolved.iterdir()):
-                rel = item.relative_to(runner.workspace_dir)
-                kind = "DIR " if item.is_dir() else "FILE"
-                size = f"{item.stat().st_size:8d} B" if item.is_file() else "         "
-                entries.append(f"[{kind}] {size}  {rel}")
+                if item.is_symlink():
+                    continue
+                try:
+                    rel = item.relative_to(runner.workspace_dir)
+                    is_dir = item.is_dir() and not item.is_symlink()
+                    kind = "DIR " if is_dir else "FILE"
+                    size = f"{item.stat().st_size:8d} B" if (not is_dir and item.is_file()) else "         "
+                    entries.append(f"[{kind}] {size}  {rel}")
+                except OSError:
+                    continue
         else:
-            for root, dirs, files in os.walk(resolved):
+            for root, dirs, files in os.walk(resolved, followlinks=False):
                 root_path = Path(root)
                 rel_root = root_path.relative_to(resolved)
                 depth = len(rel_root.parts)
+                # Filter out symlinked directories so they are neither listed nor traversed
+                dirs[:] = [d for d in dirs if not (root_path / d).is_symlink()]
                 if depth >= max_depth:
                     dirs.clear()  # Do not recurse deeper
                 for d in sorted(dirs):
@@ -334,8 +367,13 @@ def list_dir(
                     entries.append(f"[DIR ]            {rel}")
                 for f in sorted(files):
                     p = root_path / f
-                    rel = p.relative_to(runner.workspace_dir)
-                    entries.append(f"[FILE] {p.stat().st_size:8d} B  {rel}")
+                    if p.is_symlink():
+                        continue
+                    try:
+                        rel = p.relative_to(runner.workspace_dir)
+                        entries.append(f"[FILE] {p.stat().st_size:8d} B  {rel}")
+                    except OSError:
+                        continue
 
         output = f"=== Directory: {path} ({len(entries)} items) ===\n" + "\n".join(entries)
         return ToolResult(call_id=cid, name="list_dir", output=output, is_error=False)

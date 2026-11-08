@@ -92,6 +92,30 @@ class TestToolPrimitives(unittest.TestCase):
         self.assertTrue(bin_patch.is_error)
         self.assertEqual(bin_patch.call_id, "call_bin")
 
+    def test_symlink_escape_rejected_and_list_dir_ignores_symlinks(self):
+        outside_dir = tempfile.TemporaryDirectory()
+        try:
+            outside_file = Path(outside_dir.name) / "secret.txt"
+            outside_file.write_text("top_secret", encoding="utf-8")
+            link_path = self.workspace / "evil_link.txt"
+            try:
+                link_path.symlink_to(outside_file)
+            except OSError:
+                # Windows without developer mode / symlink privilege: skip symlink creation
+                return
+
+            read_res = read_file(self.runner, "evil_link.txt")
+            self.assertTrue(read_res.is_error)
+
+            write_res = write_file(self.runner, "evil_link.txt", "overwrite")
+            self.assertTrue(write_res.is_error)
+
+            list_res = list_dir(self.runner, ".", recursive=True)
+            self.assertFalse(list_res.is_error)
+            self.assertNotIn("evil_link.txt", list_res.output)
+        finally:
+            outside_dir.cleanup()
+
 
 if __name__ == "__main__":
     unittest.main()

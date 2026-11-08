@@ -10,7 +10,7 @@ python -m pip install -e .
 PYTHONPATH=src python -m unittest discover tests
 # Windows PowerShell:
 $env:PYTHONPATH="src" ; python -m unittest discover tests
-# Expected: Ran 118 tests in ~60s OK (27 skipped if Docker daemon is not running)
+# Expected: Ran 134 tests in ~60s OK (skipped=1 on Windows POSIX termios test)
 
 # Run demo sprint (zero API cost, no keys needed)
 python main.py --mock
@@ -81,16 +81,16 @@ main.py
 The project uses `src/` layout. Nothing in `src/` imports with a `src.` prefix — all imports are relative to `src/` (e.g., `from agent_core.types import ...`). `pyproject.toml` sets `pythonpath = ["src"]` for pytest, but `main.py` manually prepends `src` to `sys.path` at startup. For any script or test runner that doesn't go through `main.py`, you must set `PYTHONPATH=src`.
 
 ### Tests use `unittest`, not pytest
-The test command is `python -m unittest discover tests`, not `pytest`. While pytest can run these tests, the project's own invocations, CI expectations, and README all use `unittest`. The suite targets `tests/` directly, and `tests/ux_simulation/` contains additional simulation tests (118 tests total).
+The test command is `python -m unittest discover tests`, not `pytest`. While pytest can run these tests, the project's own invocations, CI expectations, and README all use `unittest`. The suite targets `tests/` directly, and `tests/ux_simulation/` contains additional simulation tests (134 tests total).
 
 ### `ScriptedMockGateway` is FIFO per model
 When writing tests that exercise `PairProgrammingEngine`, you must queue responses in exact turn order, keyed by the model name string. The mock dequeues one response per `send_chat` call for that model. If the queue is exhausted, it raises `StopIteration`. Test setup in `test_e2e_mock_sprint.py` is the canonical example.
 
 ### Review approval is string-based
-`PairProgrammingEngine._run_review_phase` checks `"LGTM" in response.upper()`. The mock gateway's review responses must include the literal string `LGTM` (case-insensitive) to trigger approval. If approval is missing, the refactor loop activates (up to `max_refactor_attempts=3`). In mock tests with a fully scripted gateway, the refactor loop will exhaust the queue if LGTM is absent.
+`PairProgrammingEngine._run_review_phase` checks for a standalone `\bLGTM\b` token without preceding negations or post-LGTM blocking caveats, and verifies that the reviewing model is distinct from the implementing model. The mock gateway's review responses must include the literal string `LGTM` (case-insensitive) to trigger approval. If approval is missing, the refactor loop activates (up to `max_refactor_attempts=3`). In mock tests with a fully scripted gateway, the refactor loop will exhaust the queue if LGTM is absent.
 
 ### DoD verification runs inside the sandbox
-`BacklogManager.verify_dod()` calls `runner.run_command("python -m compileall -q .")` and `runner.run_command("python -m unittest")` inside `sandbox_workspace/`. Tests written by the agent to `tests/` within the sandbox (not the repo's `tests/`) are what get validated. The sandbox and the repo test suite are entirely separate.
+`BacklogManager.verify_dod()` verifies that stdlib verification modules are not shadowed, runs a harness-owned smoke check, checks RED-phase pinned test SHA-256 hashes (`snapshot_test_hashes`), and calls `runner.run_command("python -m compileall -q .")` and `runner.run_command("python -m unittest")` inside `sandbox_workspace/`. Tests written by the agent to `tests/` within the sandbox (not the repo's `tests/`) are what get validated. The sandbox and the repo test suite are entirely separate.
 
 ### Tool primitives never raise
 All functions in `src/tools/primitives.py` catch all exceptions and return `ToolResult(is_error=True)`. Never let a primitive propagate an exception — the engine logs the error and continues the turn. This is a hard rule; break it and the harness crashes mid-sprint.
@@ -126,9 +126,11 @@ Models are specified as `provider/model-name` (e.g., `anthropic/claude-3-5-sonne
 | `PAIR_PROGRAMMER_TOKEN` | Optional bearer token for the web API; generated token is used when unset | — |
 | `MODEL_A` | First model identifier | `anthropic/claude-3-5-sonnet` |
 | `MODEL_B` | Second model identifier | `gemini/gemini-2.5-flash` |
-| `SANDBOX_TIMEOUT_SECONDS` | Subprocess watchdog | `60` |
-| `SANDBOX_MODE` | `local_process` or `docker` | `local_process` |
+| `SANDBOX_TIMEOUT_SECONDS` | Subprocess watchdog (`[1, 600]`) | `60` |
+| `SANDBOX_MAX_OUTPUT_CHARS` | Max output chars (`[100, 100000]`) | `8000` |
+| `SANDBOX_MODE` | `docker` or `local_process` (live mode requires `--unsafe-local` for `local_process`) | `docker` |
 | `SANDBOX_IMAGE` | Docker image for sandbox | `python:3.11-slim` |
+| `SANDBOX_REQUIRE_DIGEST` | `1`/`true` requires `@sha256:<64-hex>` digest on `SANDBOX_IMAGE` | `0` |
 | `GIT_AUTOMATION` | `1`/`true` enables GitManager | `0` |
 | `GIT_BASE_BRANCH` | Base branch for story merges | `main` |
 | `OPENAI_BASE_URL` | Override for OpenAI-compatible endpoint | `https://api.openai.com/v1` |

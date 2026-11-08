@@ -226,11 +226,33 @@ class BacklogManager:
                 story.dod = dod
                 return dod
 
-        # 1. Harness-owned smoke test outside agent-writable tests/
+        # 1. Check for stdlib harness module shadowing in the workspace
+        forbidden_shadows = {
+            "unittest.py",
+            "compileall.py",
+            "site.py",
+            "sitecustomize.py",
+            "usercustomize.py",
+            "unittest",
+            "compileall",
+        }
+        shadowed: List[str] = []
+        for check_dir in (runner.workspace_dir, runner.workspace_dir / "src", runner.workspace_dir / "tests"):
+            if check_dir.is_dir():
+                for name in forbidden_shadows:
+                    candidate = check_dir / name
+                    if candidate.exists():
+                        shadowed.append(candidate.relative_to(runner.workspace_dir).as_posix())
+        if shadowed:
+            failure_notes.append(
+                f"Workspace shadows standard library verification modules: {', '.join(sorted(shadowed))}."
+            )
+
+        # 2. Harness-owned smoke test outside agent-writable tests/
         py_env = build_sandbox_python_env(runner)
         smoke_res = runner.run_command("python -c \"import sys, unittest; sys.exit(0)\"", trusted_env=py_env)
-        smoke_ok = smoke_res.is_success
-        if not smoke_ok:
+        smoke_ok = smoke_res.is_success and not shadowed
+        if not smoke_res.is_success:
             failure_notes.append(f"Harness environment smoke check failed:\n{smoke_res.format_output()}")
 
         # 2. Syntax check

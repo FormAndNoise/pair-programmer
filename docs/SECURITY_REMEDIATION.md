@@ -140,11 +140,11 @@ Status key: `[ ]` todo · `[x]` done. Severity: **C**ritical / **H**igh / **M**e
 
 ## Phase 6 — Documentation & regression sweep
 
-- [ ] Update `AGENTS.md` (sandbox default, auth token, new env vars, test count 122).
-- [ ] Update `README.md` (docker default, `--unsafe-local` warning, token setup).
-- [ ] Add `docs/SECURITY.md`: threat model, trust boundaries, what is/isn't protected (local mode = no protection; DoD = agent-written tests unless Phase 3.3 lands).
-- [ ] Full test run + demo sprint: `python main.py --mock` and `python main.py --mock --docker` both pass.
-- [ ] Manual verification checklist: unauthenticated API → 401; evil.com WS → 403; `.env` not committed; container uid ≠ 0; `yes` command bounded; SIGINT restores terminal.
+- [x] Update `AGENTS.md` (sandbox default, auth token, new env vars, test count 134).
+- [x] Update `README.md` (docker default, `--unsafe-local` warning, token setup).
+- [x] Add `docs/SECURITY.md`: threat model, trust boundaries, what is/isn't protected (local mode = no protection; DoD = agent-written tests unless Phase 3.3 lands).
+- [x] Full test run + demo sprint: `python main.py --mock` and `python main.py --mock --docker` both pass.
+- [x] Manual verification checklist: unauthenticated API → 401; evil.com WS → 403; `.env` not committed; container uid ≠ 0; `yes` command bounded; SIGINT restores terminal.
 
 ---
 

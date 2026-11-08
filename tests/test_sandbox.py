@@ -85,6 +85,37 @@ class TestSandboxRunner(unittest.TestCase):
                 else:
                     os.environ[k] = prev
 
+    def test_shell_metacharacters_not_expanded_in_local_process(self):
+        """Verify shell=False executes literal argv without shell command chaining."""
+        res = self.runner.run_command(
+            "python -c \"import sys; print('LITERAL_ARG:' + sys.argv[1])\" \"rm -rf /tmp/x; curl evil\""
+        )
+        self.assertEqual(res.exit_code, 0)
+        self.assertIn("LITERAL_ARG:rm -rf /tmp/x; curl evil", res.stdout)
+
+    def test_binary_stdout_replaced_cleanly_without_unicode_error(self):
+        """Verify non-UTF8 bytes in child output are replaced instead of crashing."""
+        res = self.runner.run_command(
+            "python -c \"import sys; sys.stdout.buffer.write(b'ok_\\xff\\xfe_done\\n')\""
+        )
+        self.assertEqual(res.exit_code, 0)
+        self.assertIn("ok_", res.stdout)
+        self.assertIn("_done", res.stdout)
+
+    def test_non_positive_timeout_rejected_and_limits_clamped(self):
+        """Verify timeout_seconds <= 0 returns an error and constructor limits are clamped."""
+        clamped = SandboxRunner(
+            workspace_dir=self.workspace,
+            default_timeout_seconds=9999,
+            max_output_chars=10,
+        )
+        self.assertEqual(clamped.default_timeout, 600)
+        self.assertEqual(clamped.max_output_chars, 100)
+
+        bad_res = self.runner.run_command("python -c \"print(1)\"", timeout_seconds=0)
+        self.assertEqual(bad_res.exit_code, -1)
+        self.assertIn("timeout_seconds", bad_res.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -199,6 +199,19 @@ class TestDockerSandboxRunnerOutputTruncation(unittest.TestCase):
         result = self.runner.run_command("echo short_output")
         self.assertNotIn("[TRUNCATED:", result.stdout)
 
+    def test_runaway_output_stream_bounded_and_container_cleaned_up(self) -> None:
+        """Verify runaway stdout stream is bounded by pipe reader and leaves no container."""
+        import subprocess
+        result = self.runner.run_command("yes", timeout_seconds=2)
+        self.assertLessEqual(len(result.stdout), 800)
+        ps = subprocess.run(
+            ["docker", "ps", "-q", "--filter", "name=^pp-sandbox-"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(ps.stdout.strip(), "")
+
 
 @unittest.skipUnless(DOCKER_AVAILABLE, "Docker daemon not available on this host — skipping Phase 3 tests.")
 class TestDockerSandboxRunnerNetworkIsolation(unittest.TestCase):
@@ -381,6 +394,23 @@ class TestDockerSandboxRunnerNoDaemon(unittest.TestCase):
         self.assertTrue(self.runner._docker_available())
         self.runner._cached_docker_available = False
         self.assertFalse(self.runner._docker_available())
+
+    def test_require_digest_rejects_unpinned_tag(self) -> None:
+        """Verify require_digest=True rejects mutable image tags without @sha256: digest."""
+        from sandbox.docker_runner import DockerSandboxRunner
+        with self.assertRaises(ValueError):
+            DockerSandboxRunner(
+                workspace_dir=self.workspace,
+                image="python:3.11-slim",
+                require_digest=True,
+            )
+        pinned = DockerSandboxRunner(
+            workspace_dir=self.workspace,
+            image="python:3.11-slim@sha256:" + ("a" * 64),
+            require_digest=True,
+            docker_binary="docker_does_not_exist_sentinel",
+        )
+        self.assertTrue(pinned.require_digest)
 
 
 if __name__ == "__main__":

@@ -127,7 +127,7 @@ pair programmer/
 │   ├── src/App.tsx           # Sprint brief, backlog, activity, and operator controls
 │   └── vite.config.ts        # Local API and WebSocket proxy
 │
-├── tests/                   # Complete automated test suite (118 unit & simulation tests)
+├── tests/                   # Complete automated test suite (134 unit & simulation tests)
 │   ├── test_types.py        # Contract validation and provider format tests
 │   ├── test_events.py       # EventBus subscription & history tests
 │   ├── test_sandbox.py      # Path traversal blocking & timeout watchdog tests
@@ -181,7 +181,7 @@ python -m pip install -e .
 
 ### 3. Run the Automated Test Suite
 
-Before making any code changes, verify that all 118 unit and integration tests pass:
+Before making any code changes, verify that all 134 unit and integration tests pass:
 
 ```powershell
 $env:PYTHONPATH="src" ; python -m unittest discover tests
@@ -190,7 +190,7 @@ $env:PYTHONPATH="src" ; python -m unittest discover tests
 
 Expected output:
 ```text
-Ran 118 tests in ~60s
+Ran 134 tests in ~60s
 OK
 ```
 
@@ -226,7 +226,7 @@ Watch the terminal:
 
 ### 5. Run with Live Foundation Models
 
-To launch a live coding sprint with real LLMs:
+To launch a live coding sprint with real LLMs (defaults to `SANDBOX_MODE=docker`; pass `--unsafe-local` only if you explicitly want unisolated host execution):
 
 ```bash
 python main.py --epic "Build a command-line markdown to HTML converter"

@@ -8,6 +8,7 @@ container code cannot make outbound calls.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -15,8 +16,16 @@ import uuid
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from agent_core.sanitize import strip_ansi
-from sandbox.runner import ExecutionResult, SandboxRunner, _scrub_environment
+from sandbox.runner import (
+    ExecutionResult,
+    SandboxRunner,
+    _run_bounded_subprocess,
+    _scrub_environment,
+    sanitize_and_truncate_output,
+)
+
+
+_DIGEST_PATTERN = re.compile(r"@sha256:[0-9a-fA-F]{64}$")
 
 
 # Sentinel returned when Docker is not reachable on this host.
@@ -57,12 +66,26 @@ class DockerSandboxRunner:
         max_output_chars: int = 8000,
         image: str = "python:3.11-slim",
         docker_binary: str = "docker",
+        require_digest: Optional[bool] = None,
     ) -> None:
         self.workspace_dir = Path(workspace_dir).resolve()
-        self.default_timeout = default_timeout_seconds
-        self.max_output_chars = max_output_chars
+        self.default_timeout = max(1, min(600, int(default_timeout_seconds)))
+        self.max_output_chars = max(100, min(100_000, int(max_output_chars)))
         self.image = image
         self.docker_binary = docker_binary
+        if require_digest is None:
+            env_req = os.environ.get("SANDBOX_REQUIRE_DIGEST", "0").strip().lower()
+            self.require_digest = env_req in {"1", "true", "yes"}
+        else:
+            self.require_digest = bool(require_digest)
+
+        if self.require_digest and not _DIGEST_PATTERN.search(self.image):
+            raise ValueError(
+                f"SANDBOX_REQUIRE_DIGEST is enabled, but image '{self.image}' is not pinned "
+                "to an immutable '@sha256:<64-hex>' digest."
+            )
+
+        self.resolved_image_digest: Optional[str] = None
         self._cached_docker_available: Optional[bool] = None
         self._image_verified: bool = False
         self._orphans_reaped: bool = False
@@ -81,10 +104,8 @@ class DockerSandboxRunner:
         Confinement is enforced on the host before the container runs.
         """
         raw_path = Path(target_path)
-        if raw_path.is_absolute():
-            resolved = raw_path.resolve()
-        else:
-            resolved = (self.workspace_dir / raw_path).resolve()
+        candidate = raw_path if raw_path.is_absolute() else (self.workspace_dir / raw_path)
+        resolved = candidate.resolve()
 
         try:
             resolved.relative_to(self.workspace_dir)
@@ -93,6 +114,15 @@ class DockerSandboxRunner:
                 f"Path traversal detected: '{target_path}' resolves to '{resolved}', "
                 f"which is outside sandbox workspace '{self.workspace_dir}'."
             )
+
+        if candidate.is_symlink():
+            link_target = candidate.resolve(strict=False)
+            try:
+                link_target.relative_to(self.workspace_dir)
+            except ValueError:
+                raise PermissionError(
+                    f"Symlink escape detected: '{target_path}' links outside sandbox workspace."
+                )
 
         return resolved
 
@@ -116,6 +146,16 @@ class DockerSandboxRunner:
         Returns ExecutionResult with ``timed_out=True`` when the watchdog fires.
         Returns a failure result when Docker is not available.
         """
+        if timeout_seconds is not None and int(timeout_seconds) <= 0:
+            return ExecutionResult(
+                command=command,
+                exit_code=-1,
+                stdout="",
+                stderr="Invalid timeout_seconds: must be a positive integer.",
+                timed_out=False,
+                duration_ms=0.0,
+            )
+
         if not self._docker_available():
             result = DOCKER_UNAVAILABLE_RESULT.model_copy(update={"command": command})
             return result
@@ -128,7 +168,7 @@ class DockerSandboxRunner:
             self._ensure_image_available()
             self._image_verified = True
 
-        timeout = timeout_seconds or self.default_timeout
+        timeout = max(1, min(600, int(timeout_seconds))) if timeout_seconds is not None else self.default_timeout
         container_name = f"pp-sandbox-{uuid.uuid4().hex[:12]}"
         combined_env = dict(extra_env or {})
         combined_env.update(trusted_env or {})
@@ -148,26 +188,28 @@ class DockerSandboxRunner:
 
         timed_out = False
         start_time = time.perf_counter()
+        max_stream_bytes = max(self.max_output_chars * 4, 65_536)
 
         try:
-            proc = subprocess.run(
-                docker_args,
-                capture_output=True,
-                text=True,
-                timeout=timeout + 5,  # outer Python timeout is slightly longer
-            )
-            stdout = proc.stdout or ""
-            stderr = proc.stderr or ""
-            exit_code = proc.returncode
+            def _kill_docker_proc(proc: subprocess.Popen) -> None:
+                self._kill_escaped_container(container_name)
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
-        except subprocess.TimeoutExpired as exc:
-            timed_out = True
-            exit_code = -1
-            stdout = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-            stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-            stderr += f"\n[WATCHDOG] Container terminated after exceeding {timeout}s."
-            # Targeted kill for the specific container name
-            self._kill_escaped_container(container_name)
+            exit_code, stdout, stderr, timed_out = _run_bounded_subprocess(
+                docker_args,
+                cwd=str(self.workspace_dir),
+                env=os.environ.copy(),
+                timeout=timeout + 5,
+                max_capture_bytes=max_stream_bytes,
+                hard_kill_bytes=max(max_stream_bytes * 4, 2_000_000),
+                kill_callback=_kill_docker_proc,
+            )
+            if timed_out:
+                stderr += f"\n[WATCHDOG] Container terminated after exceeding {timeout}s."
+                self._kill_escaped_container(container_name)
 
         except FileNotFoundError:
             # docker binary not found at all
@@ -179,6 +221,7 @@ class DockerSandboxRunner:
             exit_code = -1
             stdout = ""
             stderr = f"Internal Docker execution failure: {exc}"
+            self._kill_escaped_container(container_name)
 
         duration_ms = (time.perf_counter() - start_time) * 1000.0
 
@@ -253,8 +296,9 @@ class DockerSandboxRunner:
         """
         try:
             check = subprocess.run(
-                [self.docker_binary, "image", "inspect", self.image],
+                [self.docker_binary, "image", "inspect", "--format", "{{index .RepoDigests 0}}", self.image],
                 capture_output=True,
+                text=True,
                 timeout=10,
             )
             if check.returncode != 0:
@@ -263,6 +307,14 @@ class DockerSandboxRunner:
                     capture_output=True,
                     timeout=120,
                 )
+                check = subprocess.run(
+                    [self.docker_binary, "image", "inspect", "--format", "{{index .RepoDigests 0}}", self.image],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+            if check.returncode == 0 and check.stdout:
+                self.resolved_image_digest = check.stdout.strip()
         except Exception:
             pass  # Proceed; let run_command surface Docker errors naturally.
 
@@ -341,23 +393,8 @@ class DockerSandboxRunner:
             pass
 
     def _sanitize_and_truncate(self, text: str) -> str:
-        """Truncate excessive output strings with an informative banner.
-
-        Identical logic to SandboxRunner._sanitize_and_truncate.
-        """
-        text = strip_ansi(text)
-        if len(text) <= self.max_output_chars:
-            return text
-
-        omitted_count = len(text) - self.max_output_chars
-        head_chars = self.max_output_chars // 2
-        tail_chars = self.max_output_chars // 2
-
-        return (
-            text[:head_chars]
-            + f"\n\n... [TRUNCATED: {omitted_count} characters omitted to protect context window] ...\n\n"
-            + text[-tail_chars:]
-        )
+        """Truncate excessive output strings with an informative banner."""
+        return sanitize_and_truncate_output(text, self.max_output_chars)
 
     # ------------------------------------------------------------------
     # Compatibility shim: delegate to the host-side SandboxRunner
