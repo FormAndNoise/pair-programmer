@@ -404,6 +404,61 @@ class TestAgilePairEngine(unittest.TestCase):
         self.assertFalse(dod.is_complete)
         self.assertIn("No unit tests", dod.notes or "")
 
+    def test_green_phase_mutating_pinned_tests_fails_dod(self):
+        """Mutating tests/ after RED test-pinning causes verify_dod to fail."""
+        (self.workspace / "tests").mkdir(parents=True, exist_ok=True)
+        test_file = self.workspace / "tests" / "test_pin.py"
+        test_file.write_text(
+            "import unittest\n"
+            "class TestPinned(unittest.TestCase):\n"
+            "    def test_strict(self):\n"
+            "        self.assertEqual(2 + 2, 4)\n",
+            encoding="utf-8",
+        )
+        backlog_mgr = BacklogManager.from_epic("Test Pinning Guard")
+        story = backlog_mgr.add_story(
+            title="Pinned Story",
+            human_interaction_contract="No-op contract.",
+        )
+        story.pinned_test_hashes = backlog_mgr.snapshot_test_hashes(self.runner)
+
+        # Simulate GREEN mutating the test file to weaken assertions
+        test_file.write_text(
+            "import unittest\n"
+            "class TestPinned(unittest.TestCase):\n"
+            "    def test_strict(self):\n"
+            "        self.assertTrue(True)\n",
+            encoding="utf-8",
+        )
+        dod = backlog_mgr.verify_dod(story, self.runner, cross_review_approved=True, require_ux_audit=False)
+        self.assertFalse(dod.tests_passed)
+        self.assertFalse(dod.is_complete)
+        self.assertIn("integrity check failed", dod.notes or "")
+
+    def test_reviewer_equal_to_implementer_denies_approval(self):
+        """Cross-model review rejects LGTM when test_model equals impl_model."""
+        backlog_mgr = BacklogManager.from_epic("Self-Review Guard")
+        story = backlog_mgr.add_story(
+            title="No Self Approval",
+            human_interaction_contract="`fn()` returns `1`.",
+        )
+        self.mock_gateway.queue_text_response(model="claude-3-5", content="Everything looks great. LGTM.")
+        engine = PairProgrammingEngine(
+            config=self.config,
+            backlog_mgr=backlog_mgr,
+            runner=self.runner,
+            registry=self.registry,
+            gateway=self.mock_gateway,
+            bus=self.bus,
+        )
+        _, is_approved = engine._run_review_phase(
+            story=story,
+            test_model="claude-3-5",
+            impl_model="claude-3-5",
+            impl_content="def fn(): return 1",
+        )
+        self.assertFalse(is_approved)
+
 
 if __name__ == "__main__":
     unittest.main()

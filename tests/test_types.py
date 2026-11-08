@@ -101,6 +101,33 @@ class TestAgentTypes(unittest.TestCase):
             )
         self.assertTrue(backlog.is_complete)
 
+    def test_pydantic_invariants_reject_extra_fields_nan_and_oversized_content(self):
+        from pydantic import ValidationError
+
+        with self.assertRaises(ValidationError):
+            ToolCall(name="read_file", unexpected_field="rejected")
+
+        with self.assertRaises(ValidationError):
+            Message(role=Role.USER, content="hi", timestamp=float("nan"))
+
+        with self.assertRaises(ValidationError):
+            Message(role=Role.USER, content="x" * 100_001)
+
+        with self.assertRaises(ValidationError):
+            ToolResult(call_id="c1", name="read_file", output="y" * 100_001)
+
+        with self.assertRaises(ValidationError):
+            UserStory(
+                title="Valid",
+                human_interaction_contract="Valid",
+                acceptance_criteria=["z" * 2001],
+            )
+
+    def test_tool_role_without_tool_result_raises_value_error(self):
+        msg = Message(role=Role.TOOL, content="orphan tool message")
+        with self.assertRaises(ValueError):
+            msg.to_provider_format()
+
 
 if __name__ == "__main__":
     unittest.main()

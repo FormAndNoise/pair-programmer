@@ -24,7 +24,11 @@ DOCKER_AVAILABLE = shutil.which("docker") is not None
 if DOCKER_AVAILABLE:
     import subprocess as _sp
     try:
-        _check = _sp.run(["docker", "info"], capture_output=True, timeout=5)
+        _check = _sp.run(
+            ["docker", "version", "--format", "{{.Server.Version}}"],
+            capture_output=True,
+            timeout=10,
+        )
         DOCKER_AVAILABLE = _check.returncode == 0
     except Exception:
         DOCKER_AVAILABLE = False
@@ -121,6 +125,19 @@ class TestDockerSandboxRunnerInterface(unittest.TestCase):
         """Verify that execution duration is recorded and positive."""
         result = self.runner.run_command("echo timing_check")
         self.assertGreater(result.duration_ms, 0.0)
+
+    def test_container_runs_as_non_root_with_read_only_rootfs(self) -> None:
+        """Verify container process runs as uid 65534 and blocks writes to rootfs."""
+        uid_res = self.runner.run_command("id -u")
+        self.assertEqual(uid_res.exit_code, 0)
+        self.assertEqual(uid_res.stdout.strip(), "65534")
+
+        ro_res = self.runner.run_command("touch /etc/evil_probe")
+        self.assertNotEqual(ro_res.exit_code, 0)
+        self.assertIn("Read-only file system", ro_res.stderr)
+
+        tmp_res = self.runner.run_command("touch /tmp/ephemeral_ok && rm /tmp/ephemeral_ok")
+        self.assertEqual(tmp_res.exit_code, 0)
 
 
 @unittest.skipUnless(DOCKER_AVAILABLE, "Docker daemon not available on this host — skipping Phase 3 tests.")

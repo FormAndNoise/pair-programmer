@@ -64,9 +64,33 @@ class TestToolPrimitives(unittest.TestCase):
         self.assertTrue((self.workspace / "test.txt").exists())
 
         # Dispatch unrecognized tool
-        unknown_res = self.registry.dispatch("nonexistent_tool", {})
+        unknown_res = self.registry.dispatch("nonexistent_tool", {}, call_id="call_unknown_1")
         self.assertTrue(unknown_res.is_error)
+        self.assertEqual(unknown_res.call_id, "call_unknown_1")
         self.assertIn("not recognized", unknown_res.output)
+
+    def test_call_id_correlation_and_atomic_write_limits(self):
+        res = self.registry.dispatch(
+            "write_file",
+            {"path": "correlated.txt", "content": "atomic_ok"},
+            call_id="call_corr_42",
+        )
+        self.assertFalse(res.is_error)
+        self.assertEqual(res.call_id, "call_corr_42")
+
+        oversized = write_file(self.runner, "huge.txt", "a" * 1_000_005, call_id="call_big")
+        self.assertTrue(oversized.is_error)
+        self.assertEqual(oversized.call_id, "call_big")
+
+        bin_patch = patch_file(
+            self.runner,
+            "correlated.txt",
+            target_snippet="atomic\x00_ok",
+            replacement_snippet="clean",
+            call_id="call_bin",
+        )
+        self.assertTrue(bin_patch.is_error)
+        self.assertEqual(bin_patch.call_id, "call_bin")
 
 
 if __name__ == "__main__":

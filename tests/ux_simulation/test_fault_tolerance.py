@@ -15,7 +15,11 @@ _DOCKER_AVAILABLE = shutil.which("docker") is not None
 if _DOCKER_AVAILABLE:
     import subprocess as _sp
     try:
-        _r = _sp.run(["docker", "info"], capture_output=True, timeout=5)
+        _r = _sp.run(
+            ["docker", "version", "--format", "{{.Server.Version}}"],
+            capture_output=True,
+            timeout=10,
+        )
         _DOCKER_AVAILABLE = _r.returncode == 0
     except Exception:
         _DOCKER_AVAILABLE = False

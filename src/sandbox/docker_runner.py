@@ -7,6 +7,7 @@ container code cannot make outbound calls.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import time
@@ -63,6 +64,8 @@ class DockerSandboxRunner:
         self.image = image
         self.docker_binary = docker_binary
         self._cached_docker_available: Optional[bool] = None
+        self._image_verified: bool = False
+        self._orphans_reaped: bool = False
 
         # Ensure workspace exists on the host before any mount attempt.
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -116,6 +119,14 @@ class DockerSandboxRunner:
         if not self._docker_available():
             result = DOCKER_UNAVAILABLE_RESULT.model_copy(update={"command": command})
             return result
+
+        if not self._orphans_reaped:
+            self._reap_orphaned_containers()
+            self._orphans_reaped = True
+
+        if not self._image_verified:
+            self._ensure_image_available()
+            self._image_verified = True
 
         timeout = timeout_seconds or self.default_timeout
         container_name = f"pp-sandbox-{uuid.uuid4().hex[:12]}"
@@ -194,14 +205,44 @@ class DockerSandboxRunner:
             return False
         try:
             result = subprocess.run(
-                [self.docker_binary, "info"],
+                [self.docker_binary, "version", "--format", "{{.Server.Version}}"],
                 capture_output=True,
-                timeout=5,
+                timeout=10,
             )
             self._cached_docker_available = (result.returncode == 0)
         except Exception:
             self._cached_docker_available = False
         return self._cached_docker_available
+
+    def _reap_orphaned_containers(self) -> None:
+        """Remove exited or dead pp-sandbox-* containers from previous runs."""
+        try:
+            ps = subprocess.run(
+                [
+                    self.docker_binary,
+                    "ps",
+                    "-aq",
+                    "--filter",
+                    "name=^pp-sandbox-",
+                    "--filter",
+                    "status=exited",
+                    "--filter",
+                    "status=dead",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if ps.returncode == 0 and ps.stdout:
+                container_ids = [cid.strip() for cid in ps.stdout.splitlines() if cid.strip()]
+                if container_ids:
+                    subprocess.run(
+                        [self.docker_binary, "rm", "-f", *container_ids],
+                        capture_output=True,
+                        timeout=10,
+                    )
+        except Exception:
+            pass
 
     def _ensure_image_available(self) -> None:
         """Pull the configured image if it is not already present locally.
@@ -239,16 +280,22 @@ class DockerSandboxRunner:
 
         args: List[str] = [
             self.docker_binary, "run",
-            "--rm",                            # Auto-remove container on exit
-            "--network", "none",               # Air-gapped: no outbound traffic
-            "--memory", "512m",                # Cap resident memory
-            "--cpus", "1.0",                   # Limit to 1 logical CPU
-            "--pids-limit", "128",             # Limit child processes against fork bombs
-            "--cap-drop=ALL",                  # Drop all capabilities
-            "--security-opt", "no-new-privileges",  # Block privilege escalation
-            "--stop-timeout", str(timeout),    # Docker stop grace period
-            "-v", f"{host_path}:/workspace",   # Bind-mount the workspace
-            "-w", "/workspace",                # Set working directory
+            "--rm",                                    # Auto-remove container on exit
+            "--init",                                  # Reap zombies and forward signals
+            "--network", "none",                       # Air-gapped: no outbound traffic
+            "--read-only",                             # Read-only root filesystem
+            "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",  # Ephemeral writable /tmp
+            "--user", "65534:65534",                   # Unprivileged nobody:nogroup user
+            "--memory", "512m",                        # Cap resident memory
+            "--memory-swap", "512m",                   # Disable swap beyond memory cap
+            "--cpus", "1.0",                           # Limit to 1 logical CPU
+            "--pids-limit", "128",                     # Limit child processes against fork bombs
+            "--ulimit", "nofile=1024:1024",            # Cap open file descriptors
+            "--cap-drop=ALL",                          # Drop all capabilities
+            "--security-opt", "no-new-privileges",     # Block privilege escalation
+            "--stop-timeout", str(timeout),            # Docker stop grace period
+            "-v", f"{host_path}:/workspace",           # Bind-mount the workspace
+            "-w", "/workspace",                        # Set working directory
         ]
 
         if container_name:
@@ -263,8 +310,13 @@ class DockerSandboxRunner:
         for key, value in scrubbed_env.items():
             args += ["-e", f"{key}={value}"]
 
-        # Always set PYTHONUNBUFFERED and PAGER for clean execution.
-        args += ["-e", "PYTHONUNBUFFERED=1", "-e", "PAGER=cat"]
+        # Always set clean non-root execution variables.
+        args += [
+            "-e", "HOME=/tmp",
+            "-e", "PYTHONDONTWRITEBYTECODE=1",
+            "-e", "PYTHONUNBUFFERED=1",
+            "-e", "PAGER=cat",
+        ]
 
         args += [self.image, "sh", "-c", command]
         return args
