@@ -181,7 +181,7 @@ python -m pip install -e .
 
 ### 3. Run the Automated Test Suite
 
-Before making any code changes, verify that all 134 unit and integration tests pass:
+Before making any code changes, verify that all 150 unit and integration tests pass:
 
 ```powershell
 $env:PYTHONPATH="src" ; python -m unittest discover tests
@@ -190,7 +190,7 @@ $env:PYTHONPATH="src" ; python -m unittest discover tests
 
 Expected output:
 ```text
-Ran 134 tests in ~60s
+Ran 150 tests in ~65s
 OK
 ```
 

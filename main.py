@@ -23,8 +23,8 @@ from agile.backlog import BacklogManager
 from agile.pair_engine import PairProgrammingEngine
 from gateway.client import ModelGateway
 from gateway.mock import ScriptedMockGateway
-from sandbox.runner import SandboxRunner
-from sandbox.docker_runner import DockerSandboxRunner
+from sandbox.runner import SandboxRunner, validate_workspace_path
+from sandbox.docker_runner import DEFAULT_PRODUCTION_IMAGE, DockerSandboxRunner
 from sandbox.git_manager import GitManager
 from tools.registry import ToolRegistry
 from tui.app import PairProgrammingTUI
@@ -76,13 +76,23 @@ def _build_runner(args, sandbox_path: Path) -> SandboxRunner | DockerSandboxRunn
     """Select and construct the sandbox runner based on CLI flags and environment.
 
     Reads SANDBOX_MODE from the environment when --docker is not specified.
-    Prints the selected mode to stderr so the user sees it on startup.
+    Prints the selected mode to stdout so the operator sees it on startup.
     """
+    try:
+        validated_sandbox = validate_workspace_path(sandbox_path)
+    except ValueError as exc:
+        raise SystemExit(strip_ansi(str(exc))) from None
+
     timeout = _bounded_env_int("SANDBOX_TIMEOUT_SECONDS", 60, 1, 600)
     max_output = _bounded_env_int("SANDBOX_MAX_OUTPUT_CHARS", 8000, 100, 100_000)
     unsafe_local = bool(getattr(args, "unsafe_local", False))
-    default_mode = "local_process" if unsafe_local else "docker"
-    sandbox_mode = os.getenv("SANDBOX_MODE", default_mode).strip().lower()
+    is_mock = bool(getattr(args, "mock", False))
+    raw_env_mode = os.getenv("SANDBOX_MODE")
+    if raw_env_mode is not None:
+        sandbox_mode = raw_env_mode.strip().lower()
+    else:
+        sandbox_mode = "local_process" if (unsafe_local or is_mock) else "docker"
+
     if sandbox_mode not in {"local_process", "docker"}:
         raise SystemExit(
             f"Invalid SANDBOX_MODE={strip_ansi(sandbox_mode)!r}; expected 'local_process' or 'docker'."
@@ -94,14 +104,14 @@ def _build_runner(args, sandbox_path: Path) -> SandboxRunner | DockerSandboxRunn
 
     if use_docker:
         runner = DockerSandboxRunner(
-            workspace_dir=sandbox_path,
+            workspace_dir=validated_sandbox,
             default_timeout_seconds=timeout,
             max_output_chars=max_output,
-            image=os.getenv("SANDBOX_IMAGE", "python:3.11-slim"),
+            image=os.getenv("SANDBOX_IMAGE", DEFAULT_PRODUCTION_IMAGE),
         )
-        print(strip_ansi(f"[Sandbox] Mode: Docker  image={runner.image}  workspace={sandbox_path}"))
+        print(strip_ansi(f"[Sandbox] Mode: Docker  image={runner.image}  workspace={validated_sandbox}"))
     else:
-        if not unsafe_local and not getattr(args, "mock", False):
+        if not unsafe_local and not is_mock:
             raise SystemExit(
                 "Refusing unisolated local_process sandbox in live mode. "
                 "Use Docker (default) or pass --unsafe-local to acknowledge host execution."
@@ -109,15 +119,15 @@ def _build_runner(args, sandbox_path: Path) -> SandboxRunner | DockerSandboxRunn
         print(
             strip_ansi(
                 "[SECURITY WARNING] Running in local_process mode without container isolation. "
-                "Agent commands execute directly on the host OS."
+                "Subprocesses have direct host filesystem and network access."
             )
         )
         runner = SandboxRunner(
-            workspace_dir=sandbox_path,
+            workspace_dir=validated_sandbox,
             default_timeout_seconds=timeout,
             max_output_chars=max_output,
         )
-        print(strip_ansi(f"[Sandbox] Mode: local_process  workspace={sandbox_path}"))
+        print(strip_ansi(f"[Sandbox] Mode: local_process  workspace={validated_sandbox}"))
     return runner
 
 
@@ -146,7 +156,7 @@ def run_demo_mock_sprint(console: Console, sandbox_dir: Path, use_docker: bool =
     tui = PairProgrammingTUI(bus=bus, console=console)
     git_mgr = _attach_git_manager(console, bus, sandbox_dir) if use_git else None
     runner = _build_runner(
-        argparse.Namespace(docker=use_docker, unsafe_local=not use_docker, mock=True),
+        argparse.Namespace(docker=use_docker, unsafe_local=False, mock=True),
         sandbox_dir,
     )
     registry = ToolRegistry(runner)
@@ -267,13 +277,17 @@ def main() -> None:
     console = Console()
 
     parser = argparse.ArgumentParser(description="Dual-Model Cross-Vendor Pair Programming Agent")
-    parser.add_argument("--mock", action="store_true", help="Run simulated sprint using ScriptedMockGateway (zero API cost)")
+    parser.add_argument(
+        "--mock",
+        action="store_true",
+        help="Run trusted simulated sprint using ScriptedMockGateway (defaults to local_process unless --docker or SANDBOX_MODE=docker is set)",
+    )
     parser.add_argument("--simulate-ux", action="store_true", help="Execute complete automated desktop AI UX simulation and scorecard")
     parser.add_argument("--docker", action="store_true", help="Use Docker container sandbox instead of local subprocess (requires Docker daemon)")
     parser.add_argument(
         "--unsafe-local",
         action="store_true",
-        help="Allow unisolated local_process sandbox execution on the host OS",
+        help="Allow unisolated local_process sandbox execution on the host OS (subprocesses have host access)",
     )
     parser.add_argument("--git", action="store_true", help="Automate conventional story branches, per-model commits, and --no-ff merges")
     parser.add_argument("--epic", type=str, default="Build Core CLI", help="Objective or Epic to implement")
@@ -292,7 +306,10 @@ def main() -> None:
     parser.add_argument("--sandbox", type=str, default="./sandbox_workspace", help="Path to isolated sandbox workspace")
 
     args = parser.parse_args()
-    sandbox_path = Path(args.sandbox).resolve()
+    try:
+        sandbox_path = validate_workspace_path(args.sandbox)
+    except ValueError as exc:
+        raise SystemExit(strip_ansi(str(exc))) from None
 
     if args.web:
         loopback_host = _loopback_bind_host(args.web_host)

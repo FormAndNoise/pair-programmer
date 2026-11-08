@@ -195,6 +195,55 @@ class TestOutsideInUXEvaluator(unittest.TestCase):
         self.assertEqual(scorecard.exit_code, 0)
         self.assertIn("verified", scorecard.feedback)
 
+    def test_unrecognized_contract_fails_closed_even_when_tests_pass(self) -> None:
+        """R-05: Unrecognized prose contracts fail closed instead of falling back to unittest."""
+        (self.workspace / "test_pass.py").write_text(
+            "import unittest\nclass T(unittest.TestCase):\n    def test_ok(self): self.assertTrue(True)\n",
+            encoding="utf-8",
+        )
+        story = UserStory(
+            title="Prose Contract",
+            human_interaction_contract="The system should feel fast and responsive to the user.",
+        )
+        scorecard = self.evaluator.evaluate_story_contract(story)
+        self.assertFalse(scorecard.passed)
+        self.assertIn("Contract does not match supported", scorecard.feedback)
+
+    def test_executable_python_in_contract_args_or_expected_is_rejected(self) -> None:
+        """R-05: Executable expressions in contract args/expected are rejected by ast.literal_eval."""
+        (self.workspace / "mod.py").write_text("def echo(x):\n    return x\n", encoding="utf-8")
+        marker = self.workspace / "rce_marker.txt"
+        evil_story = UserStory(
+            title="Evil Contract",
+            human_interaction_contract=(
+                f"`echo(__import__('pathlib').Path({marker.as_posix()!r}).write_text('pwn'))` returns `3`."
+            ),
+        )
+        scorecard = self.evaluator.evaluate_story_contract(evil_story)
+        self.assertFalse(scorecard.passed)
+        self.assertFalse(marker.exists())
+        self.assertIn("Non-literal", scorecard.feedback)
+
+    def test_ambiguous_function_across_multiple_modules_rejected_unless_qualified(self) -> None:
+        """R-05: Defining the target function in multiple modules fails unless module-qualified."""
+        (self.workspace / "a_stub.py").write_text("def compute(x: int) -> int:\n    return 0\n", encoding="utf-8")
+        (self.workspace / "b_real.py").write_text("def compute(x: int) -> int:\n    return x + 1\n", encoding="utf-8")
+
+        unqualified = UserStory(
+            title="Ambiguous Call",
+            human_interaction_contract="`compute(5)` returns `6`.",
+        )
+        sc_unqual = self.evaluator.evaluate_story_contract(unqualified)
+        self.assertFalse(sc_unqual.passed)
+        self.assertIn("Ambiguous", sc_unqual.feedback)
+
+        qualified = UserStory(
+            title="Qualified Call",
+            human_interaction_contract="`b_real.compute(5)` returns `6`.",
+        )
+        sc_qual = self.evaluator.evaluate_story_contract(qualified)
+        self.assertTrue(sc_qual.passed)
+
 
 if __name__ == "__main__":
     unittest.main()

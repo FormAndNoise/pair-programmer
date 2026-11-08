@@ -22,10 +22,14 @@ from sandbox.runner import (
     _run_bounded_subprocess,
     _scrub_environment,
     sanitize_and_truncate_output,
+    validate_workspace_path,
 )
 
 
 _DIGEST_PATTERN = re.compile(r"@sha256:[0-9a-fA-F]{64}$")
+DEFAULT_PRODUCTION_IMAGE = (
+    "python:3.11-slim@sha256:db20d8506e2f15b6db39b40b6015ca46bae855dec6dd326d462cfe79ae972893"
+)
 
 
 # Sentinel returned when Docker is not reachable on this host.
@@ -64,11 +68,11 @@ class DockerSandboxRunner:
         workspace_dir: str | Path,
         default_timeout_seconds: int = 60,
         max_output_chars: int = 8000,
-        image: str = "python:3.11-slim",
+        image: str = DEFAULT_PRODUCTION_IMAGE,
         docker_binary: str = "docker",
         require_digest: Optional[bool] = None,
     ) -> None:
-        self.workspace_dir = Path(workspace_dir).resolve()
+        self.workspace_dir = validate_workspace_path(workspace_dir)
         self.default_timeout = max(1, min(600, int(default_timeout_seconds)))
         self.max_output_chars = max(100, min(100_000, int(max_output_chars)))
         self.image = image
@@ -318,6 +322,20 @@ class DockerSandboxRunner:
         except Exception:
             pass  # Proceed; let run_command surface Docker errors naturally.
 
+    @staticmethod
+    def _encode_mount_spec(workspace_path: str | Path) -> str:
+        """Validate and encode a host path into a safe Docker ``--mount`` specification."""
+        host_path = str(workspace_path).rstrip("/\\")
+        if not host_path:
+            raise ValueError("Refusing to mount filesystem root into container workspace.")
+        if any(ch in host_path for ch in ("\x00", "\r", "\n", ",")):
+            raise ValueError(f"Unsafe characters in workspace mount path: {host_path!r}")
+        # Allow a single colon only as a Windows drive prefix (e.g. C:\...)
+        colon_stripped = re.sub(r"^[A-Za-z]:(?=[\\/])", "", host_path)
+        if ":" in colon_stripped:
+            raise ValueError(f"Unsupported colon in workspace mount path: {host_path!r}")
+        return f"type=bind,source={host_path},target=/workspace"
+
     def _build_docker_args(
         self,
         command: str,
@@ -327,8 +345,7 @@ class DockerSandboxRunner:
         trusted_loader_keys: frozenset[str] = frozenset(),
     ) -> List[str]:
         """Build the ``docker run`` argument list for the given command."""
-        # Sanitize workspace path for Docker volume syntax (no trailing slash)
-        host_path = str(self.workspace_dir).rstrip("/\\")
+        mount_spec = self._encode_mount_spec(self.workspace_dir)
 
         args: List[str] = [
             self.docker_binary, "run",
@@ -346,7 +363,7 @@ class DockerSandboxRunner:
             "--cap-drop=ALL",                          # Drop all capabilities
             "--security-opt", "no-new-privileges",     # Block privilege escalation
             "--stop-timeout", str(timeout),            # Docker stop grace period
-            "-v", f"{host_path}:/workspace",           # Bind-mount the workspace
+            "--mount", mount_spec,                     # Bind-mount the workspace safely
             "-w", "/workspace",                        # Set working directory
         ]
 

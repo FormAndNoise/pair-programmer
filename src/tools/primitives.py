@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import difflib
 import os
+import stat
 import tempfile
 import uuid
 from pathlib import Path
@@ -11,8 +12,10 @@ from typing import Optional
 from agent_core.types import ToolResult
 from sandbox.runner import SandboxRunner
 
-MAX_WRITE_BYTES = 1_000_000  # 1 MB content limit
-MAX_READ_BYTES = 2_000_000   # 2 MB content limit
+MAX_WRITE_BYTES = 1_000_000       # 1 MB content limit
+MAX_READ_BYTES = 2_000_000        # 2 MB content limit
+MAX_LIST_DIR_ENTRIES = 1000       # Max entries returned by list_dir
+MAX_TOOL_OUTPUT_CHARS = 85_000    # Keep well below ToolResult.output 100k limit
 
 
 def _resolve_call_id(call_id: Optional[str]) -> str:
@@ -21,21 +24,92 @@ def _resolve_call_id(call_id: Optional[str]) -> str:
 
 
 def _reject_symlink(runner: SandboxRunner, target_path: str) -> None:
-    """Raise PermissionError if target_path or any workspace parent is a symlink."""
+    """Raise PermissionError if target_path or any intermediate parent is a symlink."""
+    if "\x00" in str(target_path):
+        raise PermissionError("Invalid path: NUL byte detected.")
     raw = Path(target_path)
     candidate = raw if raw.is_absolute() else (runner.workspace_dir / raw)
+
+    # Walk from workspace_dir down to candidate, checking lstat on every existing component
+    try:
+        rel_parts = candidate.absolute().relative_to(runner.workspace_dir).parts
+    except ValueError:
+        # Let runner.resolve_path raise the canonical Path traversal PermissionError
+        runner.resolve_path(target_path)
+        rel_parts = ()
+
+    cur = runner.workspace_dir
+    if cur.is_symlink():
+        raise PermissionError("Sandbox workspace root must not be a symbolic link.")
+    for part in rel_parts:
+        cur = cur / part
+        try:
+            st = os.lstat(cur)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(st.st_mode) or cur.is_symlink():
+            raise PermissionError(
+                f"Symlink access rejected: '{target_path}' traverses symbolic link '{cur.name}'."
+            )
+
     if candidate.is_symlink():
         raise PermissionError(
             f"Symlink access rejected: '{target_path}' is a symbolic link."
         )
-    # Check intermediate parents up to workspace_dir
-    current = candidate.parent
-    while current != runner.workspace_dir and current != current.parent:
-        if current.is_symlink():
+
+
+def _verify_parent_dir_safe(runner: SandboxRunner, parent: Path, target_path: str) -> None:
+    """Verify parent directory is inside workspace and not a symlink before/after mkdir."""
+    _reject_symlink(runner, target_path)
+    st_l = os.lstat(parent)
+    st_s = os.stat(parent)
+    if stat.S_ISLNK(st_l.st_mode) or not os.path.samestat(st_l, st_s):
+        raise PermissionError(
+            f"Symlink traversal rejected: parent directory of '{target_path}' is a symbolic link."
+        )
+    parent.resolve().relative_to(runner.workspace_dir)
+
+
+def _read_workspace_file_safe(runner: SandboxRunner, resolved: Path, raw_path: str) -> tuple[str, int]:
+    """Open and read a workspace file using O_NOFOLLOW (when available) and inode verification."""
+    _reject_symlink(runner, raw_path)
+    st_before = os.lstat(resolved)
+    if stat.S_ISLNK(st_before.st_mode):
+        raise PermissionError(f"Symlink access rejected: '{raw_path}' is a symbolic link.")
+    if stat.S_ISDIR(st_before.st_mode):
+        raise IsADirectoryError(raw_path)
+    if st_before.st_size > MAX_READ_BYTES:
+        raise ValueError(
+            f"Error: File '{raw_path}' size ({st_before.st_size} bytes) exceeds limit of {MAX_READ_BYTES} bytes."
+        )
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(resolved, flags)
+    try:
+        st_fd = os.fstat(fd)
+        st_after = os.lstat(resolved)
+        if (
+            stat.S_ISLNK(st_after.st_mode)
+            or not os.path.samestat(st_before, st_fd)
+            or not os.path.samestat(st_fd, st_after)
+        ):
             raise PermissionError(
-                f"Symlink traversal rejected: parent directory '{current.name}' is a symbolic link."
+                f"TOCTOU / symlink swap detected while opening '{raw_path}'."
             )
-        current = current.parent
+        _reject_symlink(runner, raw_path)
+        resolved.resolve().relative_to(runner.workspace_dir)
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace", closefd=False) as f:
+            content = f.read(MAX_READ_BYTES + 1)
+        if len(content.encode("utf-8", errors="replace")) > MAX_READ_BYTES:
+            raise ValueError(
+                f"Error: File '{raw_path}' exceeds maximum size of {MAX_READ_BYTES} bytes."
+            )
+        return content, st_fd.st_size
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def read_file(
@@ -72,18 +146,12 @@ def read_file(
                 is_error=True,
             )
 
-        file_size = resolved.stat().st_size
-        if file_size > MAX_READ_BYTES:
-            return ToolResult(
-                call_id=cid,
-                name="read_file",
-                output=f"Error: File '{path}' size ({file_size} bytes) exceeds limit of {MAX_READ_BYTES} bytes.",
-                is_error=True,
-            )
+        try:
+            raw_text, _ = _read_workspace_file_safe(runner, resolved, path)
+        except ValueError as ve:
+            return ToolResult(call_id=cid, name="read_file", output=str(ve), is_error=True)
 
-        with open(resolved, "r", encoding="utf-8", errors="replace") as f:
-            Path(f.name).resolve().relative_to(runner.workspace_dir)
-            lines = f.readlines()
+        lines = raw_text.splitlines(keepends=True)
 
         total_lines = len(lines)
         start_idx = max(0, offset - 1)
@@ -123,6 +191,14 @@ def write_file(
     """Write or overwrite file contents in the sandbox atomically."""
     cid = _resolve_call_id(call_id)
     try:
+        if "\x00" in content:
+            return ToolResult(
+                call_id=cid,
+                name="write_file",
+                output="Error: write_file only supports text; NUL byte detected in content.",
+                is_error=True,
+            )
+
         content_bytes = content.encode("utf-8")
         if len(content_bytes) > MAX_WRITE_BYTES:
             return ToolResult(
@@ -143,6 +219,7 @@ def write_file(
             )
 
         resolved.parent.mkdir(parents=True, exist_ok=True)
+        _verify_parent_dir_safe(runner, resolved.parent, path)
         tmp_path: Optional[Path] = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -155,7 +232,7 @@ def write_file(
                 tmp_path = Path(f.name)
                 tmp_path.resolve().relative_to(runner.workspace_dir)
                 f.write(content)
-            _reject_symlink(runner, path)
+            _verify_parent_dir_safe(runner, resolved.parent, path)
             os.replace(tmp_path, resolved)
             tmp_path = None
         finally:
@@ -168,7 +245,7 @@ def write_file(
         return ToolResult(
             call_id=cid,
             name="write_file",
-            output=f"Successfully written {len(content)} characters to '{path}'.",
+            output=f"Successfully written {len(content_bytes)} bytes ({len(content)} characters) to '{path}'.",
             is_error=False,
         )
 
@@ -220,17 +297,10 @@ def patch_file(
                 is_error=True,
             )
 
-        if resolved.stat().st_size > MAX_READ_BYTES:
-            return ToolResult(
-                call_id=cid,
-                name="patch_file",
-                output=f"Error: Target file '{path}' exceeds maximum size of {MAX_READ_BYTES} bytes.",
-                is_error=True,
-            )
-
-        with open(resolved, "r", encoding="utf-8", errors="replace") as f:
-            Path(f.name).resolve().relative_to(runner.workspace_dir)
-            original = f.read()
+        try:
+            original, _ = _read_workspace_file_safe(runner, resolved, path)
+        except ValueError as ve:
+            return ToolResult(call_id=cid, name="patch_file", output=str(ve), is_error=True)
 
         if "\x00" in original:
             return ToolResult(
@@ -263,8 +333,20 @@ def patch_file(
             )
 
         updated = original.replace(target_snippet, replacement_snippet, 1)
+        updated_bytes = updated.encode("utf-8")
+        if len(updated_bytes) > MAX_WRITE_BYTES:
+            return ToolResult(
+                call_id=cid,
+                name="patch_file",
+                output=(
+                    f"Error: Patched file size ({len(updated_bytes)} bytes) exceeds "
+                    f"maximum limit of {MAX_WRITE_BYTES} bytes."
+                ),
+                is_error=True,
+            )
 
         resolved.parent.mkdir(parents=True, exist_ok=True)
+        _verify_parent_dir_safe(runner, resolved.parent, path)
         tmp_path: Optional[Path] = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -275,7 +357,9 @@ def patch_file(
                 prefix=".tmp_patch_",
             ) as f:
                 tmp_path = Path(f.name)
+                tmp_path.resolve().relative_to(runner.workspace_dir)
                 f.write(updated)
+            _verify_parent_dir_safe(runner, resolved.parent, path)
             os.replace(tmp_path, resolved)
             tmp_path = None
         finally:
@@ -295,11 +379,13 @@ def patch_file(
             )
         )
         diff_text = "".join(diff) or "[No visible line changes]"
+        if len(diff_text) > MAX_TOOL_OUTPUT_CHARS:
+            diff_text = diff_text[:MAX_TOOL_OUTPUT_CHARS] + "\n... [DIFF TRUNCATED] ..."
 
         return ToolResult(
             call_id=cid,
             name="patch_file",
-            output=f"Successfully patched '{path}'.\n\nUnified Diff:\n{diff_text}",
+            output=f"Successfully patched '{path}' ({len(updated_bytes)} bytes).\n\nUnified Diff:\n{diff_text}",
             is_error=False,
         )
 
@@ -324,6 +410,7 @@ def list_dir(
     """List files and subdirectories within a sandbox folder."""
     cid = _resolve_call_id(call_id)
     try:
+        _reject_symlink(runner, path)
         resolved = runner.resolve_path(path)
         if not resolved.exists():
             return ToolResult(
@@ -341,15 +428,26 @@ def list_dir(
             )
 
         entries = []
+        truncated = False
         if not recursive:
-            for item in sorted(resolved.iterdir()):
-                if item.is_symlink():
+            with os.scandir(resolved) as it:
+                raw_items = sorted(it, key=lambda e: e.name)
+            for entry in raw_items:
+                if entry.is_symlink():
                     continue
+                if len(entries) >= MAX_LIST_DIR_ENTRIES:
+                    truncated = True
+                    break
                 try:
-                    rel = item.relative_to(runner.workspace_dir)
-                    is_dir = item.is_dir() and not item.is_symlink()
+                    item_path = Path(entry.path)
+                    rel = item_path.relative_to(runner.workspace_dir)
+                    is_dir = entry.is_dir(follow_symlinks=False)
                     kind = "DIR " if is_dir else "FILE"
-                    size = f"{item.stat().st_size:8d} B" if (not is_dir and item.is_file()) else "         "
+                    size = (
+                        f"{entry.stat(follow_symlinks=False).st_size:8d} B"
+                        if (not is_dir and entry.is_file(follow_symlinks=False))
+                        else "         "
+                    )
                     entries.append(f"[{kind}] {size}  {rel}")
                 except OSError:
                     continue
@@ -359,23 +457,39 @@ def list_dir(
                 rel_root = root_path.relative_to(resolved)
                 depth = len(rel_root.parts)
                 # Filter out symlinked directories so they are neither listed nor traversed
-                dirs[:] = [d for d in dirs if not (root_path / d).is_symlink()]
+                dirs[:] = sorted(d for d in dirs if not (root_path / d).is_symlink())
                 if depth >= max_depth:
                     dirs.clear()  # Do not recurse deeper
-                for d in sorted(dirs):
+                for d in dirs:
+                    if len(entries) >= MAX_LIST_DIR_ENTRIES:
+                        truncated = True
+                        break
                     rel = (root_path / d).relative_to(runner.workspace_dir)
                     entries.append(f"[DIR ]            {rel}")
+                if truncated:
+                    break
                 for f in sorted(files):
                     p = root_path / f
                     if p.is_symlink():
                         continue
+                    if len(entries) >= MAX_LIST_DIR_ENTRIES:
+                        truncated = True
+                        break
                     try:
                         rel = p.relative_to(runner.workspace_dir)
-                        entries.append(f"[FILE] {p.stat().st_size:8d} B  {rel}")
+                        st = os.lstat(p)
+                        entries.append(f"[FILE] {st.st_size:8d} B  {rel}")
                     except OSError:
                         continue
+                if truncated:
+                    break
 
-        output = f"=== Directory: {path} ({len(entries)} items) ===\n" + "\n".join(entries)
+        body = "\n".join(entries)
+        if truncated:
+            body += f"\n... [TRUNCATED: listing capped at {MAX_LIST_DIR_ENTRIES} entries] ..."
+        if len(body) > MAX_TOOL_OUTPUT_CHARS:
+            body = body[:MAX_TOOL_OUTPUT_CHARS] + "\n... [TRUNCATED: output size limit reached] ..."
+        output = f"=== Directory: {path} ({len(entries)} items shown) ===\n" + body
         return ToolResult(call_id=cid, name="list_dir", output=output, is_error=False)
 
     except PermissionError as e:
@@ -401,7 +515,7 @@ def run_command(
         effective_timeout = (
             timeout_seconds
             if (timeout_seconds is not None and timeout_seconds > 0)
-            else getattr(runner, "timeout_seconds", 60)
+            else getattr(runner, "default_timeout", getattr(runner, "timeout_seconds", 60))
         )
         exec_res = runner.run_command(command, timeout_seconds=effective_timeout)
         formatted = exec_res.format_output()

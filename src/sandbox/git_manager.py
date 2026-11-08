@@ -15,6 +15,7 @@ then run. Keeping the git dir outside the mount closes that escape path.
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
 import shutil
@@ -24,20 +25,46 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from agent_core.events import AgentEvent, EventBus, EventType
+from sandbox.runner import build_sanitized_environment
 
-# Files that sandbox runs generate but that must never enter history.
+MAX_COMMIT_FILE_BYTES = 5_000_000  # 5 MiB max per file in git history
+
+# Files that sandbox runs generate or secret files that must never enter history.
 DEFAULT_EXCLUDES: Tuple[str, ...] = (
     "__pycache__/",
     "*.py[cod]",
     ".pytest_cache/",
     ".coverage",
+    ".tmp/",
     ".env",
     ".env.*",
     "*.pem",
     "*.key",
-    "id_rsa*",
     "*.p12",
     "*.pfx",
+    "*.jks",
+    "*.keystore",
+    "*.kdbx",
+    "id_rsa*",
+    "id_dsa*",
+    "id_ecdsa*",
+    "id_ed25519*",
+    ".netrc",
+    "_netrc",
+    ".npmrc",
+    ".pypirc",
+    "credentials.json",
+    "client_secret*.json",
+    "service-account*.json",
+)
+
+_SECRET_CONTENT_PATTERN = re.compile(
+    r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----|"
+    r"\bsk-ant-[A-Za-z0-9_-]{16,}\b|"
+    r"\bsk-(?:proj-)?[A-Za-z0-9]{20,}\b|"
+    r"\bgh[pousr]_[A-Za-z0-9]{20,}\b|"
+    r"\bAKIA[0-9A-Z]{16}\b|"
+    r"\bAIza[0-9A-Za-z_-]{35}\b"
 )
 
 _BASE_BRANCH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
@@ -343,7 +370,69 @@ class GitManager:
     def _write_excludes(self) -> None:
         info = self.git_dir / "info"
         info.mkdir(parents=True, exist_ok=True)
-        (info / "exclude").write_text("\n".join(DEFAULT_EXCLUDES) + "\n", encoding="utf-8")
+        exclude_file = info / "exclude"
+        existing_lines: List[str] = []
+        if exclude_file.exists():
+            try:
+                existing_lines = exclude_file.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                existing_lines = []
+        merged = list(existing_lines)
+        for pat in DEFAULT_EXCLUDES:
+            if pat not in merged:
+                merged.append(pat)
+        exclude_file.write_text("\n".join(merged) + "\n", encoding="utf-8")
+
+    @staticmethod
+    def _is_path_excluded(rel_posix_path: str) -> bool:
+        parts = rel_posix_path.strip("/").split("/")
+        basename = parts[-1] if parts else rel_posix_path
+        for pattern in DEFAULT_EXCLUDES:
+            clean_pat = pattern.rstrip("/")
+            if pattern.endswith("/"):
+                if any(fnmatch.fnmatchcase(p, clean_pat) for p in parts):
+                    return True
+            else:
+                if fnmatch.fnmatchcase(basename, clean_pat) or fnmatch.fnmatchcase(rel_posix_path, clean_pat):
+                    return True
+        return False
+
+    def _unstage_excluded_and_secret_files(self) -> None:
+        """Unstage any file matching DEFAULT_EXCLUDES, size caps, or secret content signatures.
+
+        Prevents a modified workspace .gitignore (e.g. ``!.env``) from forcing secrets
+        into commit history.
+        """
+        try:
+            staged_out = self._git("diff", "--cached", "--name-only")
+        except GitCommandError:
+            return
+        staged_files = [line.strip() for line in staged_out.splitlines() if line.strip()]
+        if not staged_files:
+            return
+
+        has_head = self._git_ok("rev-parse", "--verify", "--quiet", "HEAD")
+        for rel_path in staged_files:
+            rel_posix = rel_path.replace("\\", "/")
+            should_unstage = self._is_path_excluded(rel_posix)
+            full_path = self.workspace_dir / rel_path
+            if not should_unstage and full_path.is_file():
+                try:
+                    st = full_path.stat()
+                    if st.st_size > MAX_COMMIT_FILE_BYTES:
+                        should_unstage = True
+                    else:
+                        sample = full_path.read_text(encoding="utf-8", errors="replace")
+                        if _SECRET_CONTENT_PATTERN.search(sample):
+                            should_unstage = True
+                except OSError:
+                    should_unstage = True
+
+            if should_unstage:
+                if has_head:
+                    self._git_ok("reset", "-q", "HEAD", "--", rel_path)
+                else:
+                    self._git_ok("rm", "--cached", "-r", "-f", "--quiet", "--", rel_path)
 
     def _write_workspace_gitignore(self) -> None:
         """Add harness exclusions to the workspace ignore file without replacing it."""
@@ -382,6 +471,7 @@ class GitManager:
             self._git("checkout", "--quiet", branch)
 
     def _commit(self, message: str, author: Optional[str], allow_empty: bool) -> Optional[str]:
+        self._unstage_excluded_and_secret_files()
         if not allow_empty and self._git_ok("diff", "--cached", "--quiet"):
             return None
         args = ["commit", "--quiet", "--no-verify", "-m", message]
@@ -394,18 +484,18 @@ class GitManager:
         return self.head_sha()
 
     def _env(self) -> Dict[str, str]:
-        env = os.environ.copy()
+        env = build_sanitized_environment(os.environ, workspace_dir=self.workspace_dir)
         # Isolate from the operator's personal and system git config
-        # (signing, hooks, aliases, autocrlf) so runs are reproducible.
+        # (signing, hooks, aliases, autocrlf, ssh helpers) so runs are safe and reproducible.
         env["GIT_CONFIG_NOSYSTEM"] = "1"
         env["GIT_CONFIG_GLOBAL"] = os.devnull
         env["GIT_TERMINAL_PROMPT"] = "0"
+        env["GIT_ASKPASS"] = "echo"
+        env["SSH_ASKPASS"] = "echo"
         env["GIT_AUTHOR_NAME"] = HARNESS_NAME
         env["GIT_AUTHOR_EMAIL"] = HARNESS_EMAIL
         env["GIT_COMMITTER_NAME"] = HARNESS_NAME
         env["GIT_COMMITTER_EMAIL"] = HARNESS_EMAIL
-        for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
-            env.pop(key, None)
         return env
 
     def _run_raw(self, args: List[str]) -> subprocess.CompletedProcess:
@@ -422,6 +512,8 @@ class GitManager:
             f"--git-dir={self.git_dir}",
             f"--work-tree={self.workspace_dir}",
             "-c", "core.hooksPath=" + os.devnull,
+            "-c", "core.sshCommand=false",
+            "-c", "protocol.allow=never",
             "-c", "commit.gpgsign=false",
             "-c", "core.autocrlf=false",
             "-c", "core.fsmonitor=false",

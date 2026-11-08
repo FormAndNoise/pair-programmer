@@ -116,6 +116,55 @@ class TestToolPrimitives(unittest.TestCase):
         finally:
             outside_dir.cleanup()
 
+    def test_write_and_patch_size_nul_and_byte_reporting(self):
+        """R-18: Verify write_file rejects NUL and reports bytes, and patch_file enforces MAX_WRITE_BYTES."""
+        nul_res = write_file(self.runner, "nul.txt", "abc\x00def")
+        self.assertTrue(nul_res.is_error)
+        self.assertIn("NUL", nul_res.output)
+
+        ok_res = write_file(self.runner, "utf8.txt", "é" * 10)
+        self.assertFalse(ok_res.is_error)
+        self.assertIn("20 bytes", ok_res.output)
+
+        # Create a 900 KB file, then patch it so the resulting size exceeds 1 MB
+        base_content = "HEADER\n" + ("x" * 900_000)
+        write_file(self.runner, "large.txt", base_content)
+        over_patch = patch_file(
+            self.runner,
+            "large.txt",
+            target_snippet="HEADER",
+            replacement_snippet="y" * 200_000,
+        )
+        self.assertTrue(over_patch.is_error)
+        self.assertIn("exceeds maximum limit", over_patch.output)
+
+    def test_list_dir_caps_large_directory_and_run_command_uses_default_timeout(self):
+        """R-15 / R-20: Verify list_dir truncates at MAX_LIST_DIR_ENTRIES and run_command uses runner.default_timeout."""
+        from unittest.mock import patch
+        import tools.primitives as prim_mod
+
+        many_dir = self.workspace / "many"
+        many_dir.mkdir()
+        for i in range(25):
+            (many_dir / f"f_{i:03d}.txt").write_text("x", encoding="utf-8")
+
+        with patch.object(prim_mod, "MAX_LIST_DIR_ENTRIES", 10):
+            res = list_dir(self.runner, "many", recursive=False)
+        self.assertFalse(res.is_error)
+        self.assertIn("TRUNCATED: listing capped at 10 entries", res.output)
+
+        self.runner.default_timeout = 17
+        captured = {}
+
+        def _fake_run(cmd, timeout_seconds=None, **kwargs):
+            captured["timeout"] = timeout_seconds
+            from sandbox.runner import ExecutionResult
+            return ExecutionResult(command=cmd, exit_code=0, stdout="ok", stderr="")
+
+        with patch.object(self.runner, "run_command", side_effect=_fake_run):
+            run_command(self.runner, "python -V")
+        self.assertEqual(captured.get("timeout"), 17)
+
 
 if __name__ == "__main__":
     unittest.main()

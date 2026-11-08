@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -62,17 +64,122 @@ _SENSITIVE_ENV_KEYS = {
     "GITHUB_TOKEN",
     "GITLAB_TOKEN",
     "AWS_SESSION_TOKEN",
+    "DATABASE_URL",
+    "PAIR_PROGRAMMER_TOKEN",
 }
 
 _LOADER_ENV_KEYS = {
     "LD_PRELOAD",
     "LD_LIBRARY_PATH",
     "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
     "PYTHONPATH",
     "PYTHONSTARTUP",
     "PYTHONHOME",
+    "PYTHONINSPECT",
+    "PYTHONEXECUTABLE",
     "NODE_OPTIONS",
+    "RUBYOPT",
+    "PERL5OPT",
+    "JAVA_TOOL_OPTIONS",
+    "BASH_ENV",
+    "ENV",
+    "PROMPT_COMMAND",
 }
+
+_BLOCKED_ENV_PREFIXES = (
+    "ANTHROPIC_",
+    "OPENAI_",
+    "GEMINI_",
+    "GOOGLE_",
+    "OPENROUTER_",
+    "GROQ_",
+    "COHERE_",
+    "MISTRAL_",
+    "DEEPSEEK_",
+    "HF_",
+    "HUGGINGFACE_",
+    "AWS_",
+    "AZURE_",
+    "GCP_",
+    "SLACK_",
+    "GITHUB_",
+    "GITLAB_",
+    "GIT_",
+    "SSH_",
+    "DOCKER_",
+    "KUBE",
+    "PAIR_PROGRAMMER_",
+    "LD_",
+    "DYLD_",
+)
+
+_BLOCKED_ENV_EXACT = {
+    "EDITOR",
+    "VISUAL",
+    "BROWSER",
+    "DISPLAY",
+    "ASKPASS",
+    "SSH_ASKPASS",
+    "GIT_ASKPASS",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "FTP_PROXY",
+}
+
+_ALLOWED_HOST_ENV_KEYS_COMMON = {
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "TERM",
+    "TZ",
+}
+
+_ALLOWED_HOST_ENV_KEYS_WINDOWS = {
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "OS",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+    "SYSTEMDRIVE",
+}
+
+_PROTECTED_SYSTEM_ENV_KEYS = {
+    "PATH",
+    "HOME",
+    "USERPROFILE",
+    "TMP",
+    "TEMP",
+    "TMPDIR",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "SYSTEMDRIVE",
+}
+
+
+def validate_workspace_path(workspace_dir: str | Path) -> Path:
+    """Resolve and validate that workspace_dir is not a filesystem root or user home directory."""
+    resolved = Path(workspace_dir).resolve()
+    if resolved.parent == resolved:
+        raise ValueError(
+            f"Refusing unsafe sandbox workspace '{resolved}': cannot use filesystem root."
+        )
+    try:
+        home_dir = Path.home().resolve()
+        if resolved == home_dir:
+            raise ValueError(
+                f"Refusing unsafe sandbox workspace '{resolved}': cannot use user home directory."
+            )
+    except RuntimeError:
+        pass
+    return resolved
 
 
 def _scrub_environment(
@@ -81,15 +188,17 @@ def _scrub_environment(
     trusted_loader_keys: frozenset[str] = frozenset(),
     reject_path: bool = False,
 ) -> Dict[str, str]:
-    """Remove secrets and process-loader overrides from a child environment."""
+    """Remove secrets, provider configs, git/ssh hooks, and loader overrides from a mapping."""
     clean_env = dict(env)
     for k in list(clean_env.keys()):
         upper_k = k.upper()
+        if upper_k in trusted_loader_keys:
+            continue
         if (
             upper_k in _SENSITIVE_ENV_KEYS
-            or (upper_k in _LOADER_ENV_KEYS and upper_k not in trusted_loader_keys)
-            or upper_k.startswith("GIT_CONFIG_")
-            or upper_k == "DATABASE_URL"
+            or upper_k in _LOADER_ENV_KEYS
+            or upper_k in _BLOCKED_ENV_EXACT
+            or upper_k.startswith(_BLOCKED_ENV_PREFIXES)
             or upper_k.endswith(
                 (
                     "_API_KEY",
@@ -101,15 +210,75 @@ def _scrub_environment(
                     "_PRIVATE_KEY",
                     "_KEY",
                     "_CREDENTIALS",
+                    "_PROXY",
                 )
             )
-            or upper_k.startswith(("GOOGLE_", "AZURE_", "SLACK_"))
             or "_AUTH" in upper_k
             or "_PASS" in upper_k
-            or (reject_path and upper_k == "PATH")
+            or "_SECRET" in upper_k
+            or "_TOKEN" in upper_k
+            or (reject_path and upper_k in _PROTECTED_SYSTEM_ENV_KEYS)
         ):
             del clean_env[k]
     return clean_env
+
+
+def build_sanitized_environment(
+    base_env: Optional[os._Environ | Dict[str, str]] = None,
+    *,
+    workspace_dir: Optional[Path] = None,
+    extra_env: Optional[Dict[str, str]] = None,
+    trusted_env: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
+    """Construct a minimal platform-aware allowlisted environment for child processes."""
+    source = os.environ if base_env is None else base_env
+    allowed_keys = set(_ALLOWED_HOST_ENV_KEYS_COMMON)
+    if os.name == "nt":
+        allowed_keys |= _ALLOWED_HOST_ENV_KEYS_WINDOWS
+
+    env: Dict[str, str] = {}
+    for k, v in source.items():
+        if k.upper() in allowed_keys:
+            env[k] = v
+
+    if workspace_dir is not None:
+        ws_str = str(workspace_dir)
+        tmp_dir = workspace_dir / ".tmp"
+        try:
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            tmp_str = str(tmp_dir)
+        except OSError:
+            tmp_str = ws_str
+        env["HOME"] = ws_str
+        env["TMPDIR"] = tmp_str
+        env["TEMP"] = tmp_str
+        env["TMP"] = tmp_str
+
+    env["PAGER"] = "cat"
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONNOUSERSITE"] = "1"
+
+    trusted_loader_keys = frozenset((trusted_env or {}).keys()) & frozenset({"PYTHONPATH"})
+    if extra_env:
+        safe_extra = _scrub_environment(
+            extra_env,
+            trusted_loader_keys=frozenset(),
+            reject_path=True,
+        )
+        env.update(safe_extra)
+
+    env = _scrub_environment(env, trusted_loader_keys=trusted_loader_keys, reject_path=False)
+
+    if trusted_env:
+        safe_trusted = _scrub_environment(
+            trusted_env,
+            trusted_loader_keys=trusted_loader_keys,
+            reject_path=True,
+        )
+        env.update(safe_trusted)
+
+    return env
 
 
 def sanitize_and_truncate_output(text: str, max_output_chars: int) -> str:
@@ -129,6 +298,97 @@ def sanitize_and_truncate_output(text: str, max_output_chars: int) -> str:
     )
 
 
+def _create_windows_job_object() -> Optional[int]:
+    """Create a Windows Job Object configured with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE."""
+    if os.name != "nt":
+        return None
+    try:
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", ctypes.c_uint32),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", ctypes.c_uint32),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", ctypes.c_uint32),
+                ("SchedulingClass", ctypes.c_uint32),
+            ]
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_uint64),
+                ("WriteOperationCount", ctypes.c_uint64),
+                ("OtherOperationCount", ctypes.c_uint64),
+                ("ReadTransferCount", ctypes.c_uint64),
+                ("WriteTransferCount", ctypes.c_uint64),
+                ("OtherTransferCount", ctypes.c_uint64),
+            ]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+        info.BasicLimitInformation.LimitFlags = 0x2000
+        JobObjectExtendedLimitInformation = 9
+        res = kernel32.SetInformationJobObject(
+            ctypes.c_void_p(job),
+            JobObjectExtendedLimitInformation,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        )
+        if not res:
+            kernel32.CloseHandle(ctypes.c_void_p(job))
+            return None
+        return int(job)
+    except Exception:
+        return None
+
+
+def _assign_proc_to_windows_job(job: Optional[int], pid: int) -> None:
+    if os.name != "nt" or not job:
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        PROCESS_SET_QUOTA = 0x0100
+        PROCESS_TERMINATE = 0x0001
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        h_proc = kernel32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, int(pid))
+        if h_proc:
+            try:
+                kernel32.AssignProcessToJobObject(ctypes.c_void_p(job), ctypes.c_void_p(h_proc))
+            finally:
+                kernel32.CloseHandle(ctypes.c_void_p(h_proc))
+    except Exception:
+        pass
+
+
+def _close_windows_job(job: Optional[int]) -> None:
+    if os.name != "nt" or not job:
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        kernel32.TerminateJobObject(ctypes.c_void_p(job), 1)
+        kernel32.CloseHandle(ctypes.c_void_p(job))
+    except Exception:
+        pass
+
+
 def _run_bounded_subprocess(
     argv: List[str],
     *,
@@ -139,12 +399,13 @@ def _run_bounded_subprocess(
     hard_kill_bytes: int = 2_000_000,
     kill_callback: Optional[Callable[[subprocess.Popen], None]] = None,
 ) -> Tuple[int, str, str, bool]:
-    """Execute a subprocess with DEVNULL stdin and bounded pipe readers.
+    """Execute a subprocess with DEVNULL stdin, job containment, and bounded pipe readers.
 
     Prevents unbounded memory growth from output floods (e.g. ``yes``) while
     preserving head and tail bytes so normal truncation banners remain accurate.
     Returns ``(exit_code, stdout_str, stderr_str, timed_out)``.
     """
+    job_handle = _create_windows_job_object()
     proc = subprocess.Popen(
         argv,
         cwd=cwd,
@@ -155,8 +416,14 @@ def _run_bounded_subprocess(
         env=env,
         start_new_session=(os.name != "nt"),
     )
+    _assign_proc_to_windows_job(job_handle, proc.pid)
 
     half_cap = max(2048, max_capture_bytes // 2)
+
+    def _terminate_all() -> None:
+        _close_windows_job(job_handle)
+        if kill_callback is not None:
+            kill_callback(proc)
 
     def _drain_pipe(pipe, bucket: dict) -> None:
         head = bytearray()
@@ -182,8 +449,7 @@ def _run_bounded_subprocess(
 
                 if total_bytes >= hard_kill_bytes:
                     bucket["flood_killed"] = True
-                    if kill_callback is not None:
-                        kill_callback(proc)
+                    _terminate_all()
                     break
         except Exception:
             pass
@@ -209,12 +475,30 @@ def _run_bounded_subprocess(
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
-        if kill_callback is not None:
-            kill_callback(proc)
+        _terminate_all()
         try:
             proc.wait(timeout=5)
         except Exception:
             pass
+    finally:
+        # Ensure any background descendants holding pipe handles are terminated
+        if timed_out or out_bucket.get("flood_killed") or err_bucket.get("flood_killed"):
+            _terminate_all()
+        else:
+            # Give reader threads a brief moment to finish normal EOF drain before closing job
+            t_out.join(timeout=0.5)
+            t_err.join(timeout=0.5)
+            if t_out.is_alive() or t_err.is_alive():
+                _terminate_all()
+            else:
+                _close_windows_job(job_handle)
+
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
 
     t_out.join(timeout=2)
     t_err.join(timeout=2)
@@ -244,7 +528,7 @@ class SandboxRunner:
         default_timeout_seconds: int = 60,
         max_output_chars: int = 8000,
     ) -> None:
-        self.workspace_dir = Path(workspace_dir).resolve()
+        self.workspace_dir = validate_workspace_path(workspace_dir)
         self.default_timeout = max(1, min(600, int(default_timeout_seconds)))
         self.max_output_chars = max(100, min(100_000, int(max_output_chars)))
 
@@ -312,16 +596,21 @@ class SandboxRunner:
 
     @staticmethod
     def _parse_command_argv(command: str) -> List[str]:
-        """Split a command string into an argv list without invoking a shell."""
+        """Split a command string into an argv list without invoking a shell.
+
+        Preserves Windows backslash paths (e.g. ``C:\\dir\\file.py``) while still
+        supporting standard POSIX single/double quoting and escaped quotes.
+        """
         if not command or not command.strip():
             raise ValueError("Command cannot be empty.")
-        argv = shlex.split(command, posix=True)
+        # Preserve backslashes that are not escaping quotes or another backslash
+        normalized = re.sub(r'\\(?![\\"\'])', r"\\\\", command)
+        argv = shlex.split(normalized, posix=True)
         if not argv:
             raise ValueError("Command cannot be empty.")
-        # Normalize python/python3 executable to current interpreter when needed
-        if argv[0] in ("python", "python3"):
-            if shutil.which(argv[0]) is None and sys.executable:
-                argv[0] = sys.executable
+        # Normalize python/python3 executable to current interpreter when available
+        if argv[0] in ("python", "python3") and sys.executable:
+            argv[0] = sys.executable
         return argv
 
     def run_command(
@@ -365,28 +654,12 @@ class SandboxRunner:
                 duration_ms=0.0,
             )
 
-        base_env = os.environ.copy()
-        base_path = next((value for key, value in base_env.items() if key.upper() == "PATH"), None)
-        env = dict(base_env)
-        env["PAGER"] = "cat"  # Prevent git or man from opening interactive pagers
-        env["PYTHONUNBUFFERED"] = "1"
-        if extra_env:
-            env.update(extra_env)
-            if any(key.upper() == "PATH" for key in extra_env):
-                for key in list(env):
-                    if key.upper() == "PATH":
-                        del env[key]
-                if base_path is not None:
-                    env["PATH"] = base_path
-        trusted_loader_keys = frozenset((trusted_env or {}).keys()) & frozenset({"PYTHONPATH"})
-        env = _scrub_environment(env, trusted_loader_keys=trusted_loader_keys)
-        if trusted_env:
-            safe_trusted_env = _scrub_environment(
-                trusted_env,
-                trusted_loader_keys=trusted_loader_keys,
-                reject_path=True,
-            )
-            env.update(safe_trusted_env)
+        env = build_sanitized_environment(
+            os.environ,
+            workspace_dir=self.workspace_dir,
+            extra_env=extra_env,
+            trusted_env=trusted_env,
+        )
 
         timed_out = False
         try:

@@ -3,14 +3,15 @@
 ## Essential Commands
 
 ```bash
-# Install (editable, includes all runtime deps)
-python -m pip install -e .
+# Install (reproducible lockfile + editable package)
+python -m pip install -r requirements.lock
+python -m pip install --no-deps -e .
 
 # Run all tests (correct invocation — pytest is dev-only, unittest is authoritative)
 PYTHONPATH=src python -m unittest discover tests
 # Windows PowerShell:
 $env:PYTHONPATH="src" ; python -m unittest discover tests
-# Expected: Ran 134 tests in ~60s OK (skipped=1 on Windows POSIX termios test)
+# Expected: Ran 150 tests in ~65s OK (skipped=1 on Windows POSIX termios test)
 
 # Run demo sprint (zero API cost, no keys needed)
 python main.py --mock
@@ -129,11 +130,12 @@ Models are specified as `provider/model-name` (e.g., `anthropic/claude-3-5-sonne
 | `SANDBOX_TIMEOUT_SECONDS` | Subprocess watchdog (`[1, 600]`) | `60` |
 | `SANDBOX_MAX_OUTPUT_CHARS` | Max output chars (`[100, 100000]`) | `8000` |
 | `SANDBOX_MODE` | `docker` or `local_process` (live mode requires `--unsafe-local` for `local_process`) | `docker` |
-| `SANDBOX_IMAGE` | Docker image for sandbox | `python:3.11-slim` |
+| `SANDBOX_IMAGE` | Docker image for sandbox | `python:3.11-slim@sha256:db20d8506e2f15b6db39b40b6015ca46bae855dec6dd326d462cfe79ae972893` |
 | `SANDBOX_REQUIRE_DIGEST` | `1`/`true` requires `@sha256:<64-hex>` digest on `SANDBOX_IMAGE` | `0` |
 | `GIT_AUTOMATION` | `1`/`true` enables GitManager | `0` |
 | `GIT_BASE_BRANCH` | Base branch for story merges | `main` |
-| `OPENAI_BASE_URL` | Override for OpenAI-compatible endpoint | `https://api.openai.com/v1` |
+| `OPENAI_BASE_URL` | Override for OpenAI-compatible endpoint (validated against official hosts unless `ALLOW_CUSTOM_BASE_URL=1`) | `https://api.openai.com/v1` |
+| `ALLOW_CUSTOM_BASE_URL` | `1`/`true` permits custom or local `OPENAI_BASE_URL` hosts | `0` |
 
 ## Writing Style (ASD-STE100)
 

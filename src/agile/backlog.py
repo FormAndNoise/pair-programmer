@@ -5,11 +5,86 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import uuid
 from typing import Any, Dict, List, Optional
 from agent_core.events import AgentEvent, EventBus, EventType
 from agent_core.types import DefinitionOfDone, Message, Role, SprintBacklog, StoryStatus, UserStory
 from sandbox.runner import SandboxRunner
 from agile.ux_evaluator import OutsideInUXEvaluator, build_sandbox_python_env
+
+ALLOWED_TEST_COMMANDS = frozenset({
+    "python -m unittest",
+    "python -m unittest discover",
+    "python -m unittest discover -s tests",
+    "python3 -m unittest",
+    "python3 -m unittest discover",
+    "python3 -m unittest discover -s tests",
+})
+
+_HARNESS_STDLIB_SHADOW_NAMES = frozenset({
+    "unittest",
+    "compileall",
+    "site",
+    "sitecustomize",
+    "usercustomize",
+    "sys",
+    "os",
+    "builtins",
+    "importlib",
+    "ast",
+    "base64",
+    "hashlib",
+    "json",
+    "re",
+    "io",
+    "traceback",
+    "types",
+    "collections",
+    "functools",
+    "itertools",
+    "pathlib",
+    "shutil",
+    "subprocess",
+    "tempfile",
+    "threading",
+    "time",
+    "typing",
+    "warnings",
+    "weakref",
+    "abc",
+    "codecs",
+    "contextlib",
+    "copy",
+    "difflib",
+    "enum",
+    "errno",
+    "fnmatch",
+    "gc",
+    "glob",
+    "inspect",
+    "linecache",
+    "logging",
+    "marshal",
+    "operator",
+    "platform",
+    "posixpath",
+    "ntpath",
+    "genericpath",
+    "queue",
+    "random",
+    "select",
+    "selectors",
+    "signal",
+    "socket",
+    "stat",
+    "string",
+    "struct",
+    "sysconfig",
+    "textwrap",
+    "tokenize",
+    "uuid",
+    "zipimport",
+})
 
 
 class BacklogManager:
@@ -179,19 +254,30 @@ class BacklogManager:
 
     @staticmethod
     def snapshot_test_hashes(runner: SandboxRunner) -> Dict[str, str]:
-        """Compute SHA256 hashes of all test files in the sandbox workspace."""
+        """Compute SHA256 hashes of all test files and discovery configs in the sandbox workspace."""
         hashes: Dict[str, str] = {}
         workspace = runner.workspace_dir
-        tests_dir = workspace / "tests"
-        if tests_dir.is_dir():
-            for p in sorted(tests_dir.rglob("*.py")):
-                if p.is_file():
+        config_names = {"__init__.py", "conftest.py", "setup.cfg", "pyproject.toml", "unittest.cfg"}
+
+        for p in sorted(workspace.rglob("*")):
+            try:
+                if not p.is_file() or p.is_symlink():
+                    continue
+                rel_parts = p.relative_to(workspace).parts
+                if any(part.startswith(".") or part == "__pycache__" for part in rel_parts):
+                    continue
+                name = p.name
+                in_tests_dir = rel_parts[0] == "tests"
+                is_test_file = (
+                    (name.startswith("test") and name.endswith(".py"))
+                    or name.endswith("_test.py")
+                )
+                is_discovery_cfg = name in config_names
+                if in_tests_dir or is_test_file or is_discovery_cfg:
                     rel = p.relative_to(workspace).as_posix()
                     hashes[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
-        for p in sorted(workspace.glob("test*.py")):
-            if p.is_file():
-                rel = p.relative_to(workspace).as_posix()
-                hashes[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
+            except OSError:
+                continue
         return hashes
 
     def verify_dod(
@@ -202,16 +288,40 @@ class BacklogManager:
         cross_review_approved: bool = False,
         require_ux_audit: bool = True,
         require_docker_runner: bool = False,
+        require_test_pinning: bool = False,
     ) -> DefinitionOfDone:
         """Evaluate the Definition of Done (DoD) quality gate.
 
         Runs the quality gates in order: docker runner verification (if required),
-        harness smoke test, syntax check, sandbox test suite (with test pinning
-        integrity validation), cross-model review, and Outside-In UX contract audit.
+        test_command allowlist validation, stdlib/pth anti-shadowing check,
+        isolated harness smoke check, syntax check, sandbox test suite (with test
+        pinning integrity validation), cross-model review, and Outside-In UX audit.
+
+        Note on trust boundary: while harness checks verify stdlib ``unittest``
+        origin and pinned test hashes, code under test runs in the same Python
+        interpreter as the unit tests; container isolation (DockerSandboxRunner)
+        and cross-model review provide the outer containment layers.
         """
         failure_notes: List[str] = []
 
-        # 0. Docker runner verification if demanded
+        # 0a. Validate caller test_command against strict allowlist
+        normalized_cmd = " ".join((test_command or "").strip().split())
+        if normalized_cmd not in ALLOWED_TEST_COMMANDS:
+            failure_notes.append(
+                f"Rejected unsafe or unsupported test_command: {test_command!r}. "
+                f"Allowed commands: {sorted(ALLOWED_TEST_COMMANDS)}"
+            )
+            dod = DefinitionOfDone(
+                syntax_valid=False,
+                tests_passed=False,
+                cross_review_approved=cross_review_approved,
+                user_experience_verified=False,
+                notes="\n\n".join(failure_notes),
+            )
+            story.dod = dod
+            return dod
+
+        # 0b. Docker runner verification if demanded
         if require_docker_runner:
             is_docker = runner.__class__.__name__ == "DockerSandboxRunner"
             if not is_docker:
@@ -226,60 +336,82 @@ class BacklogManager:
                 story.dod = dod
                 return dod
 
-        # 1. Check for stdlib harness module shadowing in the workspace
-        forbidden_shadows = {
-            "unittest.py",
-            "compileall.py",
-            "site.py",
-            "sitecustomize.py",
-            "usercustomize.py",
-            "unittest",
-            "compileall",
-        }
+        # 1. Check for stdlib harness module shadowing or .pth hooks in the workspace
         shadowed: List[str] = []
+        for pth_file in sorted(runner.workspace_dir.rglob("*.pth")):
+            try:
+                shadowed.append(pth_file.relative_to(runner.workspace_dir).as_posix())
+            except ValueError:
+                continue
+
         for check_dir in (runner.workspace_dir, runner.workspace_dir / "src", runner.workspace_dir / "tests"):
             if check_dir.is_dir():
-                for name in forbidden_shadows:
-                    candidate = check_dir / name
-                    if candidate.exists():
-                        shadowed.append(candidate.relative_to(runner.workspace_dir).as_posix())
+                for name in _HARNESS_STDLIB_SHADOW_NAMES:
+                    for candidate in (check_dir / f"{name}.py", check_dir / name):
+                        if candidate.exists():
+                            rel_s = candidate.relative_to(runner.workspace_dir).as_posix()
+                            if rel_s not in shadowed:
+                                shadowed.append(rel_s)
         if shadowed:
             failure_notes.append(
-                f"Workspace shadows standard library verification modules: {', '.join(sorted(shadowed))}."
+                f"Workspace shadows standard library verification modules or .pth files: {', '.join(sorted(shadowed))}."
             )
 
-        # 2. Harness-owned smoke test outside agent-writable tests/
+        # 2. Isolated harness-owned smoke test (-I ignores PYTHONPATH and user site)
         py_env = build_sandbox_python_env(runner)
-        smoke_res = runner.run_command("python -c \"import sys, unittest; sys.exit(0)\"", trusted_env=py_env)
-        smoke_ok = smoke_res.is_success and not shadowed
-        if not smoke_res.is_success:
+        smoke_nonce = uuid.uuid4().hex
+        smoke_cmd = (
+            "python -I -c \""
+            "import os, sys, unittest, compileall; "
+            "u_path = os.path.abspath(unittest.__file__); "
+            "cwd_path = os.path.abspath(os.getcwd()); "
+            "assert not u_path.startswith(cwd_path), 'unittest shadowed by workspace'; "
+            f"print('HARNESS_SMOKE_OK:{smoke_nonce}')"
+            "\""
+        )
+        smoke_res = runner.run_command(smoke_cmd)
+        smoke_ok = (
+            smoke_res.is_success
+            and f"HARNESS_SMOKE_OK:{smoke_nonce}" in smoke_res.stdout
+            and not shadowed
+        )
+        if not smoke_res.is_success or f"HARNESS_SMOKE_OK:{smoke_nonce}" not in smoke_res.stdout:
             failure_notes.append(f"Harness environment smoke check failed:\n{smoke_res.format_output()}")
 
-        # 2. Syntax check
+        # 3. Syntax check
         syntax_res = runner.run_command("python -m compileall -q .", trusted_env=py_env)
         syntax_valid = syntax_res.is_success and smoke_ok
         if not syntax_valid:
             failure_notes.append(f"Syntax check failed:\n{syntax_res.format_output()}")
 
-        # 3. Test pinning integrity check (assert tests were not tampered with post-RED)
+        # 4. Test pinning integrity check (assert tests were not tampered with post-RED)
         test_tampered = False
-        if story.pinned_test_hashes is not None:
+        if require_test_pinning and story.pinned_test_hashes is None:
+            test_tampered = True
+            failure_notes.append(
+                "Test suite integrity check failed: missing RED-phase test hash snapshot."
+            )
+        elif story.pinned_test_hashes is not None:
             current_hashes = self.snapshot_test_hashes(runner)
-            if current_hashes != story.pinned_test_hashes:
+            if not story.pinned_test_hashes or current_hashes != story.pinned_test_hashes:
                 test_tampered = True
                 failure_notes.append(
-                    "Test suite integrity check failed: tests were modified, added, or deleted after the RED phase."
+                    "Test suite integrity check failed: tests or discovery configs were modified, added, or deleted after the RED phase."
                 )
 
-        # 4. Automated test run (supporting both tests/ + src/ and flat workspace layouts)
+        # 5. Automated test run (supporting both tests/ + src/ and flat workspace layouts)
         tests_dir = runner.workspace_dir / "tests"
-        has_tests_dir = tests_dir.is_dir() and any(tests_dir.rglob("test*.py"))
-        has_root_tests = any(p.is_file() for p in runner.workspace_dir.glob("test*.py"))
+        has_tests_dir = tests_dir.is_dir() and any(
+            p.is_file() for p in list(tests_dir.rglob("test*.py")) + list(tests_dir.rglob("*_test.py"))
+        )
+        has_root_tests = any(
+            p.is_file() for p in list(runner.workspace_dir.glob("test*.py")) + list(runner.workspace_dir.glob("*_test.py"))
+        )
 
-        if test_command == "python -m unittest" and has_tests_dir and not has_root_tests:
+        if normalized_cmd in ("python -m unittest", "python3 -m unittest") and has_tests_dir and not has_root_tests:
             test_res = runner.run_command("python -m unittest discover -s tests", trusted_env=py_env)
         elif (
-            test_command == "python -m unittest"
+            normalized_cmd in ("python -m unittest", "python3 -m unittest")
             and has_tests_dir
             and has_root_tests
             and not (tests_dir / "__init__.py").exists()
@@ -288,9 +420,12 @@ class BacklogManager:
             sub_res = runner.run_command("python -m unittest discover -s tests", trusted_env=py_env)
             test_res = root_res if not root_res.is_success else sub_res
         else:
-            test_res = runner.run_command(test_command, trusted_env=py_env)
+            test_res = runner.run_command(normalized_cmd, trusted_env=py_env)
 
-        no_tests_ran = "Ran 0 tests" in f"{test_res.stdout}\n{test_res.stderr}"
+        combined_out = f"{test_res.stdout}\n{test_res.stderr}"
+        ran_match = re.search(r"Ran\s+(\d+)\s+tests?\s+in\s+", combined_out)
+        tests_ran_count = int(ran_match.group(1)) if ran_match else 0
+        no_tests_ran = (tests_ran_count <= 0) or ("Ran 0 tests" in combined_out)
         tests_passed = test_res.is_success and not no_tests_ran and not test_tampered and smoke_ok
 
         if no_tests_ran:

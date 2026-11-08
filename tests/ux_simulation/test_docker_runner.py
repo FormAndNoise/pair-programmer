@@ -412,6 +412,25 @@ class TestDockerSandboxRunnerNoDaemon(unittest.TestCase):
         )
         self.assertTrue(pinned.require_digest)
 
+    def test_default_image_is_digest_pinned_and_mount_spec_validated(self) -> None:
+        """R-09: Verify default image uses @sha256 digest and mount paths are validated."""
+        from sandbox.docker_runner import DEFAULT_PRODUCTION_IMAGE, DockerSandboxRunner
+        self.assertIn("@sha256:", DEFAULT_PRODUCTION_IMAGE)
+        self.assertEqual(self.runner.image, DEFAULT_PRODUCTION_IMAGE)
+
+        win_mount = DockerSandboxRunner._encode_mount_spec(r"C:\Users\Aarik\sandbox")
+        self.assertEqual(win_mount, r"type=bind,source=C:\Users\Aarik\sandbox,target=/workspace")
+
+        posix_mount = DockerSandboxRunner._encode_mount_spec("/tmp/sandbox_ws")
+        self.assertEqual(posix_mount, "type=bind,source=/tmp/sandbox_ws,target=/workspace")
+
+        with self.assertRaises(ValueError):
+            DockerSandboxRunner._encode_mount_spec("/")
+        with self.assertRaises(ValueError):
+            DockerSandboxRunner._encode_mount_spec("/tmp/bad,inject=1")
+        with self.assertRaises(ValueError):
+            DockerSandboxRunner._encode_mount_spec("/tmp/bad:ro")
+
 
 if __name__ == "__main__":
     unittest.main()

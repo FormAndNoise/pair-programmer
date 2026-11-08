@@ -7,7 +7,8 @@ import os
 import random
 import re
 import time
-from typing import Any, Dict, List, Optional
+import urllib.parse
+from typing import Any, Dict, FrozenSet, List, Optional
 import httpx
 from agent_core.types import Message, Role, ToolCall, ToolDefinition
 
@@ -17,6 +18,39 @@ try:
     _LITELLM_AVAILABLE = True
 except ImportError:
     _LITELLM_AVAILABLE = False
+
+DEFAULT_ALLOWED_OPENAI_HOSTS: FrozenSet[str] = frozenset(
+    {
+        "api.openai.com",
+        "openrouter.ai",
+        "api.groq.com",
+    }
+)
+
+_REDACT_PATTERNS = (
+    (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-+/=]{6,}"), "Bearer [REDACTED]"),
+    (
+        re.compile(
+            r"(?i)(\b(?:x-api-key|x-goog-api-key|authorization|api[_-]?key)\s*[:=]\s*[\"']?)[A-Za-z0-9._\-+/=]{6,}([\"']?)"
+        ),
+        r"\1[REDACTED]\2",
+    ),
+    (
+        re.compile(
+            r"("
+            r"sk-(?:ant-|or-v1-|proj-|live-)?[A-Za-z0-9_-]{8,}|"
+            r"AIza[A-Za-z0-9_-]{8,}|"
+            r"gh[pousr]_[A-Za-z0-9_]{8,}|"
+            r"github_pat_[A-Za-z0-9_]{8,}|"
+            r"AKIA[0-9A-Z]{16}|"
+            r"ASIA[0-9A-Z]{16}|"
+            r"xox[baprs]-[A-Za-z0-9-]{8,}|"
+            r"gsk_[A-Za-z0-9_-]{8,}"
+            r")"
+        ),
+        "[REDACTED]",
+    ),
+)
 
 
 class ModelGateway:
@@ -31,6 +65,32 @@ class ModelGateway:
         self.api_keys = api_keys or {}
         self.timeout = timeout_seconds
         self.max_retries = max_retries
+
+    def _total_attempts(self) -> int:
+        """Return total attempts (>= 1) so max_retries <= 0 executes once without crashing."""
+        return max(1, int(self.max_retries))
+
+    @staticmethod
+    def _validate_base_url(base_url: str) -> str:
+        """Validate OpenAI-compatible base_url against official hosts unless explicitly opted in."""
+        cleaned = (base_url or "").strip().rstrip("/")
+        parsed = urllib.parse.urlparse(cleaned)
+        host = (parsed.hostname or "").lower()
+        if not parsed.scheme or not host:
+            raise ValueError(f"Invalid OPENAI_BASE_URL '{base_url}': scheme and host are required.")
+        if parsed.username or parsed.password:
+            raise ValueError("Invalid OPENAI_BASE_URL: embedded credentials in URL are forbidden.")
+
+        allow_custom = os.environ.get("ALLOW_CUSTOM_BASE_URL", "").strip().lower() in ("1", "true", "yes")
+        if parsed.scheme == "https" and host in DEFAULT_ALLOWED_OPENAI_HOSTS:
+            return cleaned
+        if allow_custom and parsed.scheme in ("https", "http"):
+            return cleaned
+        raise ValueError(
+            f"Refusing to send API credentials to untrusted OPENAI_BASE_URL '{base_url}' "
+            f"(host '{host}' is not in {sorted(DEFAULT_ALLOWED_OPENAI_HOSTS)}). "
+            "Set ALLOW_CUSTOM_BASE_URL=1 to explicitly allow custom or local endpoints."
+        )
 
     def get_api_key(self, provider: str) -> Optional[str]:
         """Fetch API key from explicit config or environment variables."""
@@ -70,22 +130,16 @@ class ModelGateway:
 
     @staticmethod
     def _status_code_of(exc: Exception) -> Optional[int]:
-        """Extract an HTTP status code from httpx/litellm exceptions when present."""
+        """Extract an HTTP status code from typed httpx/litellm exception attributes only."""
         for attr in ("status_code", "status", "code"):
             value = getattr(exc, attr, None)
-            if isinstance(value, int):
+            if isinstance(value, int) and not isinstance(value, bool):
                 return value
         response = getattr(exc, "response", None)
         if response is not None:
             value = getattr(response, "status_code", None)
-            if isinstance(value, int):
+            if isinstance(value, int) and not isinstance(value, bool):
                 return value
-        match = re.search(r"\b([45]\d{2})\b", str(exc))
-        if match:
-            try:
-                return int(match.group(1))
-            except ValueError:
-                return None
         return None
 
     @staticmethod
@@ -102,15 +156,12 @@ class ModelGateway:
         return False
 
     @staticmethod
-    def _redact(text: str, limit: int = 500) -> str:
-        """Truncate provider error bodies and strip anything key-like."""
-        truncated = str(text)[:limit]
-        truncated = re.sub(
-            r"(sk-(?:ant-|or-v1-|proj-|live-)?[A-Za-z0-9_-]{8,}|AIza[A-Za-z0-9_-]{8,}|xox[baprs]-[A-Za-z0-9-]{8,})",
-            "[REDACTED]",
-            truncated,
-        )
-        return truncated
+    def _redact(text: Any, limit: int = 500) -> str:
+        """Redact known credential formats and authorization headers, then truncate."""
+        raw = str(text)
+        for pattern, replacement in _REDACT_PATTERNS:
+            raw = pattern.sub(replacement, raw)
+        return raw[:limit]
 
     @staticmethod
     def _retry_delay(attempt: int) -> float:
@@ -119,7 +170,7 @@ class ModelGateway:
         return base + random.uniform(0, 0.5)
 
     def _should_retry(self, exc: Exception, attempt: int) -> bool:
-        if attempt >= max(1, self.max_retries) - 1:
+        if attempt >= self._total_attempts() - 1:
             return False
         return self._is_retryable_exception(exc)
 
@@ -188,19 +239,16 @@ class ModelGateway:
         if api_key:
             litellm_kwargs["api_key"] = api_key
         else:
-            # Only enforce the missing-key error when no explicit key and no
-            # environment key; LiteLLM itself may still resolve credentials,
-            # so we warn by raising only for known managed providers.
             if provider in env_map:
                 raise RuntimeError(
                     f"Missing API key for provider '{provider}': "
                     f"set {env_map[provider]} before calling send_chat."
                 )
         base_url = os.getenv("OPENAI_BASE_URL")
-        if base_url and provider in ("openai", "openrouter"):
-            litellm_kwargs["base_url"] = base_url
+        if base_url and provider in ("openai", "openrouter", "groq"):
+            litellm_kwargs["base_url"] = self._validate_base_url(base_url)
 
-        for attempt in range(self.max_retries):
+        for attempt in range(self._total_attempts()):
             try:
                 response = litellm.completion(**litellm_kwargs)
                 choice = response.choices[0].message
@@ -232,7 +280,7 @@ class ModelGateway:
                     ) from e
                 self._sleep_before_retry(attempt)
 
-        raise RuntimeError("Unreachable loop exit in _send_via_litellm")
+        raise RuntimeError(f"LiteLLM call failed for model '{model}'")
 
     def _send_via_direct_api(
         self,
@@ -242,7 +290,6 @@ class ModelGateway:
         system_prompt: Optional[str] = None,
     ) -> Message:
         """Fallback direct HTTP client for vendor endpoints without LiteLLM."""
-        # Detect provider from model string (e.g. 'openai/gpt-4o', 'gemini/gemini-2.5-flash', 'ollama/llama3')
         if "/" in model:
             provider, model_name = model.split("/", 1)
         else:
@@ -301,7 +348,7 @@ class ModelGateway:
             ]
 
         with httpx.Client(timeout=self.timeout) as client:
-            for attempt in range(self.max_retries):
+            for attempt in range(self._total_attempts()):
                 try:
                     res = client.post(url, headers=headers, json=payload)
                     res.raise_for_status()
@@ -333,7 +380,7 @@ class ModelGateway:
                         ) from e
                     self._sleep_before_retry(attempt)
 
-        raise RuntimeError("Unreachable loop exit in _send_via_anthropic")
+        raise RuntimeError(f"Anthropic API call failed for '{model_name}'")
 
     def _send_via_gemini(
         self,
@@ -381,7 +428,7 @@ class ModelGateway:
             ]
 
         with httpx.Client(timeout=self.timeout) as client:
-            for attempt in range(self.max_retries):
+            for attempt in range(self._total_attempts()):
                 try:
                     res = client.post(url, headers=headers, json=payload)
                     res.raise_for_status()
@@ -413,7 +460,7 @@ class ModelGateway:
                         ) from e
                     self._sleep_before_retry(attempt)
 
-        raise RuntimeError("Unreachable loop exit in _send_via_gemini")
+        raise RuntimeError(f"Gemini API call failed for '{model_name}'")
 
     @staticmethod
     def _to_anthropic_message(msg: Message) -> Dict[str, Any]:
@@ -490,7 +537,8 @@ class ModelGateway:
             "groq": "https://api.groq.com/openai/v1",
         }
         default_base_url = provider_base_urls.get(provider.lower(), "https://api.openai.com/v1")
-        base_url = os.environ.get("OPENAI_BASE_URL", default_base_url)
+        raw_base_url = os.environ.get("OPENAI_BASE_URL", default_base_url)
+        base_url = self._validate_base_url(raw_base_url)
 
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -522,7 +570,7 @@ class ModelGateway:
             ]
 
         with httpx.Client(timeout=self.timeout) as client:
-            for attempt in range(self.max_retries):
+            for attempt in range(self._total_attempts()):
                 try:
                     res = client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
                     res.raise_for_status()
@@ -555,4 +603,4 @@ class ModelGateway:
                         ) from e
                     self._sleep_before_retry(attempt)
 
-        raise RuntimeError("Unreachable loop exit in _send_via_openai_compatible")
+        raise RuntimeError(f"Direct API call failed for '{model_name}' at '{base_url}'")

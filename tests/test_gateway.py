@@ -354,6 +354,85 @@ class TestLiteLLMRoute(unittest.TestCase):
             self.assertEqual(called_kwargs["api_key"], "explicit-key-123")
             self.assertEqual(called_kwargs["model"], "anthropic/claude-3-5-sonnet")
 
+    def test_untrusted_openai_base_url_rejected_before_http_call(self):
+        """R-11: Setting OPENAI_BASE_URL=https://evil.example/v1 raises before any HTTP call unless ALLOW_CUSTOM_BASE_URL=1."""
+        gw = ModelGateway(api_keys={"openai": "sk-test-secret-1234567890"}, max_retries=1)
+        client_factory = mock.MagicMock()
+        with mock.patch.dict(
+            os.environ,
+            {"OPENAI_BASE_URL": "https://evil.example/v1"},
+            clear=False,
+        ), mock.patch.object(gateway_module.httpx, "Client", client_factory):
+            os.environ.pop("ALLOW_CUSTOM_BASE_URL", None)
+            with self.assertRaises(ValueError):
+                gw._send_via_direct_api(
+                    model="openai/gpt-4o",
+                    messages=[Message(role=Role.USER, content="Hi")],
+                )
+            client_factory.assert_not_called()
+
+        # When ALLOW_CUSTOM_BASE_URL=1 is set explicitly, custom base URL is permitted.
+        fake_client = _FakeHttpClient(_FakeResponse({"choices": [{"message": {"content": "custom-ok"}}]}))
+        with mock.patch.dict(
+            os.environ,
+            {"OPENAI_BASE_URL": "https://custom.internal/v1", "ALLOW_CUSTOM_BASE_URL": "1"},
+            clear=False,
+        ), mock.patch.object(gateway_module.httpx, "Client", return_value=fake_client):
+            res = gw._send_via_direct_api(
+                model="openai/gpt-4o",
+                messages=[Message(role=Role.USER, content="Hi")],
+            )
+            self.assertEqual(res.content, "custom-ok")
+            self.assertEqual(fake_client.captured_request["url"], "https://custom.internal/v1/chat/completions")
+
+    def test_redaction_and_status_classification_and_zero_retries(self):
+        """R-19: Error bodies redact ghp_/AKIA/Bearer, 400 with '500' or '404' in text is not retried, and max_retries=0 works."""
+        redacted = ModelGateway._redact(
+            "Auth failed: Bearer eyJhbGciOiJIUzI1NiJ9.secret token=ghp_1234567890abcdef123456 aws=AKIAIOSFODNN7EXAMPLE"
+        )
+        self.assertNotIn("eyJhbGciOiJIUzI1NiJ9", redacted)
+        self.assertNotIn("ghp_1234567890abcdef123456", redacted)
+        self.assertNotIn("AKIAIOSFODNN7EXAMPLE", redacted)
+        self.assertIn("[REDACTED]", redacted)
+
+        class _TypedHttp400Error(Exception):
+            def __init__(self):
+                super().__init__("Bad Request: user prompt mentioned error 500 and 404")
+                self.status_code = 400
+
+        calls = {"count": 0}
+
+        class _FailingClient:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def post(self, url, headers=None, json=None):
+                calls["count"] += 1
+                raise _TypedHttp400Error()
+
+        gw_retry = ModelGateway(api_keys={"openai": "sk-test-12345678"}, max_retries=3)
+        with mock.patch.object(gateway_module.httpx, "Client", return_value=_FailingClient()):
+            with self.assertRaises(RuntimeError):
+                gw_retry._send_via_direct_api(
+                    model="openai/gpt-4o",
+                    messages=[Message(role=Role.USER, content="Hi")],
+                )
+        self.assertEqual(calls["count"], 1)
+
+        # Verify max_retries=0 executes 1 attempt and does not hit unreachable loop error
+        calls["count"] = 0
+        gw_zero = ModelGateway(api_keys={"openai": "sk-test-12345678"}, max_retries=0)
+        fake_ok = _FakeHttpClient(_FakeResponse({"choices": [{"message": {"content": "zero-retry-ok"}}]}))
+        with mock.patch.object(gateway_module.httpx, "Client", return_value=fake_ok):
+            res = gw_zero._send_via_direct_api(
+                model="openai/gpt-4o",
+                messages=[Message(role=Role.USER, content="Hi")],
+            )
+            self.assertEqual(res.content, "zero-retry-ok")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -328,6 +328,12 @@ class TestAgilePairEngine(unittest.TestCase):
             "Do not mark LGTM yet.",
             "No LGTM: crashes on empty string.",
             "Almost LGTM, fix naming first.",
+            'The author wrote "LGTM" in a comment, remove it.',
+            "```python\n# LGTM\n```\nPlease add error handling.",
+            "> LGTM\nNeeds work.",
+            "LGTM? I am not sure.",
+            "LGTM. However, you must fix the return type first.",
+            "If you fix the crash, then LGTM.",
         ):
             self.mock_gateway.queue_text_response(model="claude-3-5", content=critique)
             _, approved = engine._run_review_phase(story, "claude-3-5", "gemini-2-5", "Implemented.")
@@ -337,6 +343,7 @@ class TestAgilePairEngine(unittest.TestCase):
             "LGTM",
             "No issues found, LGTM!",
             "Code is clean and defensive. lgtm.",
+            "All checks satisfied.\nVERDICT: LGTM",
         ):
             self.mock_gateway.queue_text_response(model="claude-3-5", content=approval)
             _, approved = engine._run_review_phase(story, "claude-3-5", "gemini-2-5", "Implemented.")
@@ -458,6 +465,57 @@ class TestAgilePairEngine(unittest.TestCase):
             impl_content="def fn(): return 1",
         )
         self.assertFalse(is_approved)
+
+    def test_dod_rejects_unsafe_test_command_and_pth_or_stdlib_shadowing(self):
+        """R-04 / R-07: Verify verify_dod rejects arbitrary test_command, .pth files, and missing snapshots when required."""
+        backlog_mgr = BacklogManager.from_epic("DoD Boundary Guard")
+        story = backlog_mgr.add_story(
+            title="Boundary Story",
+            human_interaction_contract="`fn()` returns `1`.",
+        )
+        (self.workspace / "mod.py").write_text("def fn(): return 1\n", encoding="utf-8")
+        (self.workspace / "test_mod.py").write_text(
+            "import unittest\nfrom mod import fn\nclass T(unittest.TestCase):\n    def test_fn(self): self.assertEqual(fn(), 1)\n",
+            encoding="utf-8",
+        )
+
+        # 1. Arbitrary test_command rejected before execution
+        bad_cmd_dod = backlog_mgr.verify_dod(
+            story,
+            self.runner,
+            test_command='python -c "print(1)"',
+            cross_review_approved=True,
+            require_ux_audit=False,
+        )
+        self.assertFalse(bad_cmd_dod.syntax_valid)
+        self.assertFalse(bad_cmd_dod.tests_passed)
+        self.assertIn("Rejected unsafe", bad_cmd_dod.notes or "")
+
+        # 2. Missing pinned_test_hashes when require_test_pinning=True fails closed
+        unpinned_dod = backlog_mgr.verify_dod(
+            story,
+            self.runner,
+            cross_review_approved=True,
+            require_ux_audit=False,
+            require_test_pinning=True,
+        )
+        self.assertFalse(unpinned_dod.tests_passed)
+        self.assertIn("missing RED-phase test hash snapshot", unpinned_dod.notes or "")
+
+        # 3. .pth file in workspace fails anti-shadowing check
+        pth_file = self.workspace / "evil.pth"
+        pth_file.write_text("import os\n", encoding="utf-8")
+        try:
+            pth_dod = backlog_mgr.verify_dod(
+                story,
+                self.runner,
+                cross_review_approved=True,
+                require_ux_audit=False,
+            )
+            self.assertFalse(pth_dod.syntax_valid)
+            self.assertIn("evil.pth", pth_dod.notes or "")
+        finally:
+            pth_file.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

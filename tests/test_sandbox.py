@@ -116,6 +116,93 @@ class TestSandboxRunner(unittest.TestCase):
         self.assertEqual(bad_res.exit_code, -1)
         self.assertIn("timeout_seconds", bad_res.stderr)
 
+    def test_allowlist_env_preserves_platform_vars_and_isolates_home_and_tmp(self):
+        """R-02: Verify child env preserves platform vars, isolates HOME/TMP, and drops secrets/GIT/SSH."""
+        import os
+        old_ssh = os.environ.get("GIT_SSH_COMMAND")
+        old_unlisted = os.environ.get("ARBITRARY_HOST_VAR_XYZ")
+        os.environ["GIT_SSH_COMMAND"] = "evil_ssh"
+        os.environ["ARBITRARY_HOST_VAR_XYZ"] = "should_not_leak"
+        try:
+            res = self.runner.run_command(
+                "python -c \""
+                "import os; "
+                "print('SSH:', os.environ.get('GIT_SSH_COMMAND', 'NONE')); "
+                "print('UNLISTED:', os.environ.get('ARBITRARY_HOST_VAR_XYZ', 'NONE')); "
+                "print('HOME:', os.environ.get('HOME', '')); "
+                "print('PATH_PRESENT:', bool(os.environ.get('PATH'))); "
+                "\""
+            )
+            self.assertEqual(res.exit_code, 0)
+            self.assertIn("SSH: NONE", res.stdout)
+            self.assertIn("UNLISTED: NONE", res.stdout)
+            self.assertIn("PATH_PRESENT: True", res.stdout)
+            self.assertIn(str(self.workspace), res.stdout)
+        finally:
+            if old_ssh is None:
+                os.environ.pop("GIT_SSH_COMMAND", None)
+            else:
+                os.environ["GIT_SSH_COMMAND"] = old_ssh
+            if old_unlisted is None:
+                os.environ.pop("ARBITRARY_HOST_VAR_XYZ", None)
+            else:
+                os.environ["ARBITRARY_HOST_VAR_XYZ"] = old_unlisted
+
+    def test_windows_backslash_paths_and_workspace_validation(self):
+        """R-01 / R-20: Verify Windows backslash paths parse cleanly and root/home workspaces are rejected."""
+        import argparse
+        import io
+        import os
+        from contextlib import redirect_stdout
+        from sandbox.runner import validate_workspace_path
+        import main as main_mod
+
+        argv = SandboxRunner._parse_command_argv(r'python "C:\Temp\my script.py" C:\Temp\arg.txt')
+        self.assertEqual(argv[1], r"C:\Temp\my script.py")
+        self.assertEqual(argv[2], r"C:\Temp\arg.txt")
+
+        root_path = Path(self.workspace.anchor)
+        with self.assertRaises(ValueError):
+            validate_workspace_path(root_path)
+        with self.assertRaises(ValueError):
+            validate_workspace_path(Path.home())
+
+        # Live mode refuses local_process without --unsafe-local
+        old_mode = os.environ.get("SANDBOX_MODE")
+        os.environ["SANDBOX_MODE"] = "local_process"
+        try:
+            with self.assertRaises(SystemExit):
+                main_mod._build_runner(
+                    argparse.Namespace(docker=False, unsafe_local=False, mock=False),
+                    self.workspace,
+                )
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                runner = main_mod._build_runner(
+                    argparse.Namespace(docker=False, unsafe_local=True, mock=False),
+                    self.workspace,
+                )
+            self.assertIsInstance(runner, SandboxRunner)
+            self.assertIn("SECURITY WARNING", buf.getvalue())
+        finally:
+            if old_mode is None:
+                os.environ.pop("SANDBOX_MODE", None)
+            else:
+                os.environ["SANDBOX_MODE"] = old_mode
+
+    def test_grandchild_holding_stdout_pipe_is_terminated_on_timeout(self):
+        """R-14: Verify a background grandchild inheriting stdout is killed and drain threads exit."""
+        code = (
+            "import subprocess, sys, time; "
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+            "time.sleep(30)"
+        )
+        start = time.monotonic() if hasattr(self, "_start") else __import__("time").monotonic()
+        res = self.runner.run_command(f'python -c "{code}"', timeout_seconds=1)
+        elapsed = __import__("time").monotonic() - start
+        self.assertTrue(res.timed_out)
+        self.assertLess(elapsed, 10.0)
+
 
 if __name__ == "__main__":
     unittest.main()

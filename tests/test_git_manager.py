@@ -210,6 +210,39 @@ class TestGitManagerSecurity(unittest.TestCase):
         self.git.start_story_branch("US-NOOP", "No Changes")
         self.assertIsNone(self.git.commit_phase("US-NOOP", "feat", "nothing", MODEL_A))
 
+    def test_git_env_scrubs_ssh_and_config_and_blocks_secret_or_unignored_files(self) -> None:
+        """R-06 / R-12: Verify GIT_SSH_COMMAND is scrubbed and secrets/excludes are unstaged even if .gitignore is overridden."""
+        import os
+
+        old_ssh = os.environ.get("GIT_SSH_COMMAND")
+        os.environ["GIT_SSH_COMMAND"] = f"echo pwned > {self.marker.as_posix()}"
+        try:
+            env = self.git._env()
+            self.assertNotIn("GIT_SSH_COMMAND", env)
+
+            self.git.ensure_repository()
+            self.git.start_story_branch("US-SEC2", "Secret Scan")
+            # Attempt to override .gitignore in workspace to force .env and a secret file in
+            (self.workspace / ".gitignore").write_text("!.env\n!leaked.txt\n", encoding="utf-8")
+            (self.workspace / ".env").write_text("OPENAI_API_KEY=sk-1234567890abcdefghijklmnop\n", encoding="utf-8")
+            (self.workspace / "leaked.txt").write_text(
+                "-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n", encoding="utf-8"
+            )
+            (self.workspace / "clean.py").write_text("x = 42\n", encoding="utf-8")
+
+            sha = self.git.commit_phase("US-SEC2", "feat", "commit clean only", MODEL_B)
+            self.assertIsNotNone(sha)
+            tracked = self.git._git("ls-files").splitlines()
+            self.assertIn("clean.py", tracked)
+            self.assertNotIn(".env", tracked)
+            self.assertNotIn("leaked.txt", tracked)
+            self.assertFalse(self.marker.exists())
+        finally:
+            if old_ssh is None:
+                os.environ.pop("GIT_SSH_COMMAND", None)
+            else:
+                os.environ["GIT_SSH_COMMAND"] = old_ssh
+
 
 if __name__ == "__main__":
     unittest.main()

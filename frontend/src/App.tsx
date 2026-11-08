@@ -187,6 +187,28 @@ function App() {
   }, [authToken]);
 
   useEffect(() => {
+    const STATUS_DEBOUNCE_MS = 2000;
+    let lastStatusAt = Date.now();
+    let statusDebounceTimer = 0;
+    const scheduleStatusRefresh = () => {
+      const now = Date.now();
+      const elapsed = now - lastStatusAt;
+      if (elapsed >= STATUS_DEBOUNCE_MS) {
+        lastStatusAt = now;
+        if (statusDebounceTimer) {
+          window.clearTimeout(statusDebounceTimer);
+          statusDebounceTimer = 0;
+        }
+        void loadStatus();
+      } else if (!statusDebounceTimer) {
+        statusDebounceTimer = window.setTimeout(() => {
+          statusDebounceTimer = 0;
+          lastStatusAt = Date.now();
+          void loadStatus();
+        }, STATUS_DEBOUNCE_MS - elapsed);
+      }
+    };
+
     void loadStatus();
     const poll = window.setInterval(() => void loadStatus(), 4000);
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -213,7 +235,7 @@ function App() {
         try {
           const event = JSON.parse(message.data) as AgentEvent;
           setEvents((current) => [event, ...current].slice(0, 300));
-          void loadStatus();
+          scheduleStatusRefresh();
         } catch {
           // Ignore malformed frames and keep the live stream available.
         }
@@ -223,6 +245,7 @@ function App() {
     return () => {
       closed = true;
       window.clearTimeout(retryTimer);
+      window.clearTimeout(statusDebounceTimer);
       window.clearInterval(poll);
       socket?.close();
     };

@@ -2,74 +2,120 @@
 
 import asyncio
 import hmac
+import inspect
 import json
 import os
 import secrets
+import tempfile
 import threading
 import time
 import uuid
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 from agent_core.events import AgentEvent, EventBus, EventType
+from agent_core.types import SprintBacklog, UserStory
 
 
 ALLOWED_ORIGINS = frozenset({"http://localhost:5173", "http://127.0.0.1:5173"})
 MAX_WS_CONNECTIONS = 10
 MAX_RECENT_EVENTS = 300
 REST_RATE_LIMIT = 60
+UNAUTH_REST_RATE_LIMIT = 20
 REST_RATE_WINDOW_SECONDS = 60.0
+WS_HANDSHAKE_RATE_LIMIT = 10
+WS_HANDSHAKE_WINDOW_SECONDS = 60.0
+WS_IDLE_TIMEOUT_SECONDS = 60.0
 
 
-def _load_or_create_auth_token() -> str:
-    """Load the configured token or create a private token file on first run."""
-    configured = os.environ.get("PAIR_PROGRAMMER_TOKEN", "").strip()
-    if configured:
-        return configured
+def _ensure_private_dir(directory: Path) -> None:
+    """Create directory if missing and enforce 0o700 permissions even when pre-existing."""
+    directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(directory, 0o700)
+    except OSError:
+        # Windows may not expose POSIX directory mode bits.
+        pass
 
-    token_path = Path.home() / ".pair_programmer" / "token"
 
-    def read_existing() -> str:
+def _write_token_atomically(token_path: Path, token: str) -> None:
+    """Write token to a sibling temporary file with 0o600 permissions and replace atomically."""
+    _ensure_private_dir(token_path.parent)
+    fd, tmp_name = tempfile.mkstemp(dir=str(token_path.parent), prefix=".token-")
+    tmp_path = Path(tmp_name)
+    try:
         try:
-            token = token_path.read_text(encoding="utf-8").strip()
-        except OSError as exc:
-            raise RuntimeError(f"Cannot read API token file at {token_path}: {exc}") from exc
-        if not token:
-            raise RuntimeError(f"API token file at {token_path} is empty.")
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(token + "\n")
+        os.replace(tmp_path, token_path)
         try:
             os.chmod(token_path, 0o600)
         except OSError:
-            # Windows may not expose POSIX mode bits.
             pass
-        return token
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
-    try:
-        return read_existing()
-    except RuntimeError as exc:
-        if not isinstance(exc.__cause__, FileNotFoundError):
-            raise
 
-    token_path.parent.mkdir(parents=True, exist_ok=True)
+def _load_or_create_auth_token(
+    token_path: Optional[Path] = None,
+    retry_attempts: int = 50,
+    retry_delay: float = 0.01,
+) -> str:
+    """Load the configured token or create a private token file on first run."""
+    if token_path is None:
+        configured = os.environ.get("PAIR_PROGRAMMER_TOKEN", "").strip()
+        if configured:
+            return configured
+        token_path = Path.home() / ".pair_programmer" / "token"
+
+    _ensure_private_dir(token_path.parent)
+
+    def read_existing() -> Optional[str]:
+        try:
+            content = token_path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise RuntimeError(f"Cannot read API token file at {token_path}: {exc}") from exc
+        if not content:
+            return ""
+        try:
+            os.chmod(token_path, 0o600)
+        except OSError:
+            pass
+        return content
+
+    existing = read_existing()
+    if existing:
+        return existing
+
     token = secrets.token_urlsafe(32)
-    try:
-        descriptor = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        for attempt in range(100):
+    if existing is None:
+        try:
+            descriptor = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            descriptor = None
+        if descriptor is not None:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as token_file:
+                token_file.write(token + "\n")
             try:
-                return read_existing()
-            except RuntimeError as exc:
-                if exc.__cause__ is not None and not isinstance(exc.__cause__, FileNotFoundError):
-                    raise
-                if attempt == 99:
-                    raise
-                time.sleep(0.01)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as token_file:
-        token_file.write(token + "\n")
-    try:
-        os.chmod(token_path, 0o600)
-    except OSError:
-        # Windows may not expose POSIX mode bits; the file is still created exclusively.
-        pass
+                os.chmod(token_path, 0o600)
+            except OSError:
+                pass
+            return token
+
+    # Another writer created the file concurrently or left an empty file; poll briefly.
+    for _ in range(max(1, retry_attempts)):
+        current = read_existing()
+        if current:
+            return current
+        time.sleep(retry_delay)
+
+    # Stalled or crashed writer left an empty file past the retry window; recover atomically.
+    _write_token_atomically(token_path, token)
     return token
 
 
@@ -81,6 +127,214 @@ def _constant_time_token_match(candidate: str, expected: str) -> bool:
 def _origin_is_allowed(origin: Optional[str]) -> bool:
     """Allow non-browser clients and configured local studio origins."""
     return origin is None or origin in ALLOWED_ORIGINS
+
+
+def _consume_rate_bucket(
+    buckets: "OrderedDict[str, tuple[float, float]]",
+    lock: threading.Lock,
+    key: str,
+    limit: int,
+    window_seconds: float,
+) -> bool:
+    """Consume 1 token from key's rate bucket under lock; return True if allowed."""
+    now = time.monotonic()
+    with lock:
+        tokens, updated_at = buckets.get(key, (float(limit), now))
+        tokens = min(
+            float(limit),
+            tokens + (now - updated_at) * limit / window_seconds,
+        )
+        allowed = tokens >= 1.0
+        if allowed:
+            tokens -= 1.0
+        buckets[key] = (tokens, now)
+        buckets.move_to_end(key)
+        while len(buckets) > 4096:
+            buckets.popitem(last=False)
+    return allowed
+
+
+def evaluate_rest_access(
+    *,
+    method: str,
+    origin: Optional[str],
+    authorization: str,
+    remote: str,
+    auth_token: str,
+    rate_buckets: "OrderedDict[str, tuple[float, float]]",
+    rate_lock: threading.Lock,
+    is_preflight: bool = False,
+) -> Tuple[int, Optional[Dict[str, str]], Optional[str]]:
+    """Evaluate Origin, Bearer auth, and separated auth/unauth rate-limit buckets.
+
+    Returns ``(200, None, None)`` when allowed, or ``(status_code, headers, detail)`` when denied.
+    """
+    if is_preflight:
+        if not _origin_is_allowed(origin):
+            return 403, None, "Origin not allowed."
+        return 200, None, None
+
+    if method in {"POST", "PUT", "PATCH", "DELETE"} and not _origin_is_allowed(origin):
+        return 403, None, "Origin not allowed."
+
+    scheme, separator, candidate = (authorization or "").partition(" ")
+    is_authenticated = bool(
+        separator
+        and scheme.lower() == "bearer"
+        and _constant_time_token_match(candidate.strip(), auth_token)
+    )
+
+    if is_authenticated:
+        allowed = _consume_rate_bucket(
+            rate_buckets,
+            rate_lock,
+            f"auth:{remote}",
+            REST_RATE_LIMIT,
+            REST_RATE_WINDOW_SECONDS,
+        )
+        if not allowed:
+            return 429, {"Retry-After": "1"}, "Too many requests."
+        return 200, None, None
+
+    allowed_unauth = _consume_rate_bucket(
+        rate_buckets,
+        rate_lock,
+        f"unauth:{remote}",
+        UNAUTH_REST_RATE_LIMIT,
+        REST_RATE_WINDOW_SECONDS,
+    )
+    if not allowed_unauth:
+        return 429, {"Retry-After": "1"}, "Too many requests."
+    return 401, {"WWW-Authenticate": "Bearer"}, "Authentication required."
+
+
+def redact_ws_subprotocols(subprotocols: List[str]) -> List[str]:
+    """Replace any bearer.<token> subprotocol entry with bearer.[REDACTED] for safe logging."""
+    return [
+        "bearer.[REDACTED]" if protocol.startswith("bearer.") else protocol
+        for protocol in subprotocols
+    ]
+
+
+def evaluate_ws_handshake(
+    *,
+    scope: Dict[str, Any],
+    origin: Optional[str],
+    remote: str,
+    auth_token: str,
+    rate_buckets: "OrderedDict[str, tuple[float, float]]",
+    rate_lock: threading.Lock,
+) -> Tuple[bool, int, str, Optional[str]]:
+    """Redact bearer subprotocols in scope, enforce WS handshake rate limits, and verify origin + token.
+
+    Returns ``(allowed, close_code, close_reason, accepted_subprotocol)``.
+    """
+    offered_protocols = list(scope.get("subprotocols", []))
+    scope["subprotocols"] = redact_ws_subprotocols(offered_protocols)
+
+    if not _consume_rate_bucket(
+        rate_buckets,
+        rate_lock,
+        f"ws:{remote}",
+        WS_HANDSHAKE_RATE_LIMIT,
+        WS_HANDSHAKE_WINDOW_SECONDS,
+    ):
+        return False, 1008, "Too many handshake attempts.", None
+
+    if not _origin_is_allowed(origin):
+        return False, 1008, "Origin not allowed.", None
+
+    candidate = next(
+        (protocol[len("bearer.") :] for protocol in offered_protocols if protocol.startswith("bearer.")),
+        "",
+    )
+    if not _constant_time_token_match(candidate, auth_token):
+        return False, 1008, "Authentication required.", None
+
+    accepted = "pair-programmer" if "pair-programmer" in offered_protocols else None
+    return True, 1000, "", accepted
+
+
+async def stream_ws_events_with_idle_timeout(
+    websocket: Any,
+    queue: asyncio.Queue,
+    idle_timeout: float = WS_IDLE_TIMEOUT_SECONDS,
+) -> None:
+    """Forward events from queue to websocket and close with 1000 if idle beyond idle_timeout."""
+    while True:
+        try:
+            data = await asyncio.wait_for(queue.get(), timeout=idle_timeout)
+        except asyncio.TimeoutError:
+            await websocket.close(code=1000, reason="Idle timeout exceeded.")
+            break
+        try:
+            await websocket.send_text(json.dumps(data))
+        except Exception:
+            break
+
+
+class SprintRunCoordinator:
+    """Thread-safe sprint lifecycle coordinator ensuring a single unified run_id and serialized starts."""
+
+    def __init__(self, bridge: "WebEventBridge", engine: Optional[Any]) -> None:
+        self.bridge = bridge
+        self.engine = engine
+        self.session_status: str = "ready"
+        self.sprint_task: Optional[asyncio.Task] = None
+        self.current_run_id: Optional[str] = None
+        self._lock = threading.Lock()
+
+    def _invoke_engine_run_sprint(self, run_id: str) -> Any:
+        try:
+            sig = inspect.signature(self.engine.run_sprint)
+            if "run_id" in sig.parameters or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            ):
+                return self.engine.run_sprint(run_id=run_id)
+        except (TypeError, ValueError):
+            pass
+        return self.engine.run_sprint()
+
+    async def _run_sprint_async(self, run_id: str) -> None:
+        if self.session_status != "paused":
+            self.session_status = "running"
+        try:
+            completed = await asyncio.to_thread(self._invoke_engine_run_sprint, run_id)
+            if getattr(self.engine, "stop_requested", False) or self.session_status == "stopped":
+                self.session_status = "stopped"
+            else:
+                self.session_status = "complete" if completed else "failed"
+        except Exception:
+            import traceback
+
+            traceback.print_exc()
+            self.session_status = "failed"
+            self.bridge.bus.publish(
+                AgentEvent(
+                    event_type=EventType.ERROR,
+                    payload={
+                        "error": "Sprint failed. See server logs.",
+                        "stage": "sprint",
+                        "run_id": run_id,
+                    },
+                )
+            )
+
+    async def start(self, epic: str, stories: List[UserStory]) -> Dict[str, Any]:
+        """Atomically validate active task state, assign a single run_id, and launch the sprint task."""
+        with self._lock:
+            task = self.sprint_task
+            if (task is not None and not task.done()) or self.session_status in {"starting", "running", "paused"}:
+                raise RuntimeError("A sprint is already running.")
+
+            if hasattr(self.engine, "reset_stop"):
+                self.engine.reset_stop()
+            self.engine.backlog_mgr.sprint = SprintBacklog(epic_goal=epic, stories=stories)
+            run_id = uuid.uuid4().hex
+            self.current_run_id = run_id
+            self.session_status = "starting"
+            self.sprint_task = asyncio.create_task(self._run_sprint_async(run_id))
+            return {"status": "starting", "story_count": len(stories), "run_id": run_id}
 
 
 class WebEventBridge:
@@ -177,8 +431,6 @@ class WebEventBridge:
         """Alias for unregister_client."""
         self.unregister_client(q)
 
-    register = register_client
-
     def unregister_client(self, q: asyncio.Queue) -> None:
         """Disconnect a web client."""
         with self._clients_lock:
@@ -206,19 +458,26 @@ class WebEventBridge:
         }
 
 
-def create_fastapi_app(bridge: WebEventBridge, engine: Optional[Any] = None) -> Any:
+def create_fastapi_app(
+    bridge: WebEventBridge,
+    engine: Optional[Any] = None,
+    ws_idle_timeout: float = WS_IDLE_TIMEOUT_SECONDS,
+) -> Any:
     """Optionally instantiate a FastAPI application if FastAPI is installed."""
     try:
         from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
         from fastapi.middleware.cors import CORSMiddleware
         from fastapi.responses import JSONResponse
         from pydantic import BaseModel, Field
-        from agent_core.types import SprintBacklog, UserStory
 
         auth_token = _load_or_create_auth_token()
         app = FastAPI(title="Pair Programming Agent API", version="0.1.0")
+        coordinator = SprintRunCoordinator(bridge, engine)
+        app.state.coordinator = coordinator
         app.state.session_status = "ready"
         app.state.sprint_task = None
+        app.state.current_run_id = None
+        app.state.ws_idle_timeout = ws_idle_timeout
         rate_buckets: OrderedDict[str, tuple[float, float]] = OrderedDict()
         rate_lock = threading.Lock()
         app.add_middleware(
@@ -231,7 +490,7 @@ def create_fastapi_app(bridge: WebEventBridge, engine: Optional[Any] = None) -> 
 
         @app.middleware("http")
         async def protect_api(request, call_next):
-            """Authenticate and rate-limit all REST API requests."""
+            """Authenticate and rate-limit all REST API requests with separated auth/unauth quotas."""
             path = request.url.path
             if path != "/api" and not path.startswith("/api/"):
                 return await call_next(request)
@@ -241,49 +500,19 @@ def create_fastapi_app(bridge: WebEventBridge, engine: Optional[Any] = None) -> 
                 request.method == "OPTIONS"
                 and request.headers.get("access-control-request-method") is not None
             )
-            if is_preflight:
-                if not _origin_is_allowed(origin):
-                    return JSONResponse({"detail": "Origin not allowed."}, status_code=403)
-                return await call_next(request)
-
-            if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not _origin_is_allowed(origin):
-                return JSONResponse({"detail": "Origin not allowed."}, status_code=403)
-
             remote = request.client.host if request.client is not None else "unknown"
-            now = time.monotonic()
-            with rate_lock:
-                tokens, updated_at = rate_buckets.get(remote, (float(REST_RATE_LIMIT), now))
-                tokens = min(
-                    float(REST_RATE_LIMIT),
-                    tokens + (now - updated_at) * REST_RATE_LIMIT / REST_RATE_WINDOW_SECONDS,
-                )
-                allowed = tokens >= 1.0
-                if allowed:
-                    tokens -= 1.0
-                rate_buckets[remote] = (tokens, now)
-                rate_buckets.move_to_end(remote)
-                if len(rate_buckets) > 4096:
-                    rate_buckets.popitem(last=False)
-            if not allowed:
-                return JSONResponse(
-                    {"detail": "Too many requests."},
-                    status_code=429,
-                    headers={"Retry-After": "1"},
-                )
-
-            authorization = request.headers.get("authorization", "")
-            scheme, separator, candidate = authorization.partition(" ")
-            if (
-                not separator
-                or scheme.lower() != "bearer"
-                or not _constant_time_token_match(candidate.strip(), auth_token)
-            ):
-                return JSONResponse(
-                    {"detail": "Authentication required."},
-                    status_code=401,
-                    headers={"WWW-Authenticate": "Bearer"},
-                )
-
+            status_code, headers, detail = evaluate_rest_access(
+                method=request.method,
+                origin=origin,
+                authorization=request.headers.get("authorization", ""),
+                remote=remote,
+                auth_token=auth_token,
+                rate_buckets=rate_buckets,
+                rate_lock=rate_lock,
+                is_preflight=is_preflight,
+            )
+            if status_code != 200:
+                return JSONResponse({"detail": detail}, status_code=status_code, headers=headers)
             return await call_next(request)
 
         class SteerRequest(BaseModel):
@@ -301,7 +530,10 @@ def create_fastapi_app(bridge: WebEventBridge, engine: Optional[Any] = None) -> 
         @app.get("/api/status")
         async def get_status():
             summary = bridge.get_status_summary()
-            summary["session_status"] = app.state.session_status
+            summary["session_status"] = coordinator.session_status
+            summary["run_id"] = coordinator.current_run_id
+            app.state.session_status = coordinator.session_status
+            app.state.current_run_id = coordinator.current_run_id
             if engine is not None:
                 sprint = engine.backlog_mgr.sprint
                 summary.update(
@@ -332,40 +564,11 @@ def create_fastapi_app(bridge: WebEventBridge, engine: Optional[Any] = None) -> 
         async def get_events(limit: int = Query(default=200, ge=1, le=300)):
             return {"events": bridge.get_recent_events(limit)}
 
-        async def run_sprint() -> None:
-            if app.state.session_status != "paused":
-                app.state.session_status = "running"
-            run_id = uuid.uuid4().hex
-            try:
-                completed = await asyncio.to_thread(engine.run_sprint)
-                if getattr(engine, "stop_requested", False) or app.state.session_status == "stopped":
-                    app.state.session_status = "stopped"
-                else:
-                    app.state.session_status = "complete" if completed else "failed"
-            except Exception as exc:
-                import traceback
-
-                traceback.print_exc()
-                app.state.session_status = "failed"
-                bridge.bus.publish(
-                    AgentEvent(
-                        event_type=EventType.ERROR,
-                        payload={
-                            "error": "Sprint failed. See server logs.",
-                            "stage": "sprint",
-                            "run_id": run_id,
-                        },
-                    )
-                )
-
         @app.post("/api/sprint/start", status_code=202)
         async def start_sprint(req: SprintStartRequest):
             if engine is None:
                 raise HTTPException(status_code=503, detail="Sprint controls are unavailable.")
 
-            task = app.state.sprint_task
-            if task is not None and not task.done():
-                raise HTTPException(status_code=409, detail="A sprint is already running.")
             if not req.epic.strip() or any(
                 not story.title.strip() or not story.human_interaction_contract.strip()
                 for story in req.stories
@@ -380,39 +583,39 @@ def create_fastapi_app(bridge: WebEventBridge, engine: Optional[Any] = None) -> 
                 )
                 for story in req.stories
             ]
-            if hasattr(engine, "reset_stop"):
-                engine.reset_stop()
-            elif hasattr(engine, "request_stop"):
-                pass
-            if getattr(engine, "is_paused", False):
-                engine.resume()
-            engine.backlog_mgr.sprint = SprintBacklog(epic_goal=req.epic.strip(), stories=stories)
-            app.state.session_status = "starting"
-            app.state.sprint_task = asyncio.create_task(run_sprint())
-            run_id = uuid.uuid4().hex
-            return {"status": "starting", "story_count": len(stories), "run_id": run_id}
+            try:
+                result = await coordinator.start(req.epic.strip(), stories)
+            except RuntimeError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            app.state.session_status = coordinator.session_status
+            app.state.sprint_task = coordinator.sprint_task
+            app.state.current_run_id = coordinator.current_run_id
+            return result
 
         @app.post("/api/sprint/pause")
         async def pause_sprint():
-            if engine is None or app.state.session_status not in {"running", "starting"}:
+            if engine is None or coordinator.session_status not in {"running", "starting"}:
                 raise HTTPException(status_code=409, detail="No active sprint can be paused.")
             engine.pause()
+            coordinator.session_status = "paused"
             app.state.session_status = "paused"
             return {"status": "paused"}
 
         @app.post("/api/sprint/resume")
         async def resume_sprint():
-            if engine is None or app.state.session_status != "paused":
+            if engine is None or coordinator.session_status != "paused":
                 raise HTTPException(status_code=409, detail="The sprint is not paused.")
             engine.resume()
+            coordinator.session_status = "running"
             app.state.session_status = "running"
             return {"status": "running"}
 
         @app.post("/api/sprint/stop")
         async def stop_sprint():
-            if engine is None or app.state.session_status not in {"running", "starting", "paused"}:
+            if engine is None or coordinator.session_status not in {"running", "starting", "paused"}:
                 raise HTTPException(status_code=409, detail="No active sprint can be stopped.")
             engine.request_stop()
+            coordinator.session_status = "stopped"
             app.state.session_status = "stopped"
             return {"status": "stopped"}
 
@@ -423,33 +626,28 @@ def create_fastapi_app(bridge: WebEventBridge, engine: Optional[Any] = None) -> 
 
         @app.websocket("/ws/events")
         async def websocket_endpoint(websocket: WebSocket):
+            remote = websocket.client.host if websocket.client is not None else "unknown"
             origin = websocket.headers.get("origin")
-            if not _origin_is_allowed(origin):
-                await websocket.close(code=1008, reason="Origin not allowed.")
-                return
-
-            offered_protocols = websocket.scope.get("subprotocols", [])
-            candidate = next(
-                (protocol[len("bearer.") :] for protocol in offered_protocols if protocol.startswith("bearer.")),
-                "",
+            allowed, close_code, close_reason, accepted_protocol = evaluate_ws_handshake(
+                scope=websocket.scope,
+                origin=origin,
+                remote=remote,
+                auth_token=auth_token,
+                rate_buckets=rate_buckets,
+                rate_lock=rate_lock,
             )
-            if not _constant_time_token_match(candidate, auth_token):
-                await websocket.close(code=1008, reason="Authentication required.")
+            if not allowed:
+                await websocket.close(code=close_code, reason=close_reason)
                 return
 
             queue = bridge.register_client()
             if queue is None:
                 await websocket.close(code=1013, reason="Connection limit reached.")
                 return
-            accepted_protocol = "pair-programmer" if "pair-programmer" in offered_protocols else None
+            idle_timeout = float(getattr(app.state, "ws_idle_timeout", WS_IDLE_TIMEOUT_SECONDS))
             try:
                 await websocket.accept(subprotocol=accepted_protocol)
-                while True:
-                    data = await queue.get()
-                    try:
-                        await websocket.send_text(json.dumps(data))
-                    except (WebSocketDisconnect, RuntimeError):
-                        break
+                await stream_ws_events_with_idle_timeout(websocket, queue, idle_timeout=idle_timeout)
             except WebSocketDisconnect:
                 pass
             finally:
